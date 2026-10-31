@@ -1,12 +1,37 @@
+# THE MATRIX
+
+Two crates, one workspace:
+
+```
+crates/matrix-collect   Stage 3 collector: routing trace -> NDJSON v1 -> unix socket + SQLite
+crates/matrix-app       Stage 4 native application: unix socket -> in-app state -> winit/wgpu window
+```
+
+```
+routing-trace.bin ──tail──▶ pass assembly ──▶ NDJSON events v1 ──┬──▶ unix socket ──▶ matrix-app (wgpu)
+                                                                 └──▶ SQLite WAL
+
+$ ls crates
+matrix-app  matrix-collect
+```
+
+Build (host `main`):
+
+```
+rsync -a --exclude .git --exclude target ./ main:~/matrix-build/
+ssh main 'cd ~/matrix-build && cargo build --release'
+# binaries land in target/release/{matrix-collect,matrix-app}
+```
+
+Runtime state lives only under `/home/main/the-matrix/{run,data,logs}`; the
+binaries are installed in `/home/main/the-matrix/bin/`.
+
+---
+
 # matrix-collect (Stage 3)
 
 Normalized MoE routing-event collector for the Strata engine. One binary, one
 external dependency (`rusqlite`, bundled SQLite — required by the spec).
-
-```
-routing-trace.bin ──tail──▶ pass assembly ──▶ NDJSON events v1 ──┬──▶ unix socket (N subscribers)
-                                                                 └──▶ SQLite WAL (events + projections)
-```
 
 ## Event schema v1
 
@@ -52,6 +77,11 @@ The live floor is the last **replayed** seq, so an event is either replayed or
 delivered live, never both and never silently skipped; anything the bound cut
 off is reported as `replay_truncated`.
 
+`meta` is emitted once, before any subscriber can be registered (the acceptor
+starts right after `bind` and the replay window is per session), so a client
+that attaches late never receives it. `matrix-app` handles that explicitly —
+see "Meta" below — instead of inventing a model name.
+
 ## Storage
 
 `telemetry.sqlite` (WAL, `synchronous=NORMAL`): `events` (canonical NDJSON line
@@ -96,3 +126,86 @@ matrix-collect --path /home/main/strata-0.2.4.2/data/routing-trace.bin \
 
 The engine API key is read from `--engine-conf` at runtime and never logged,
 printed or stored.
+
+---
+
+# matrix-app (Stage 4)
+
+Native viewer. `winit` + `wgpu`, instanced quads — the same pipeline the
+measured bench-A harness used (`wgpu 30.0.1`, `winit 0.30.13`, `ab_glyph
+0.2.32`, `bytemuck 1.25.2`, `pollster 0.4.0`, pinned in
+`crates/matrix-app/Cargo.toml`). **No browser, no webview, no HTTP client**: the
+only input is the collector's unix socket, and the only external process it
+ever starts is `hyprctl` (window placement) and, when explicitly asked,
+`sqlite3` (see "Meta").
+
+```
+matrix-app --socket /home/main/the-matrix/run/collector.sock \
+           --stats /home/main/the-matrix/run/app-stats.json \
+           [--meta-db /home/main/the-matrix/data/telemetry.sqlite] \
+           [--rain on|off] [--wm-fullscreen on|off] [--width N --height N]
+```
+
+Keys: `esc` quit, `r` toggle rain, `f` WM-fullscreen.
+
+## What it draws
+
+* header: title, model name, collector connection chip, telemetry-status chip;
+* left panel: current session (id, tier, requests, passes, positions, records),
+  engine sample (`perf_sample`), hardware sample (`hw_sample`), stream health
+  (seq / gaps / drops / replay / skipped bytes);
+* centre: the 48 × 512 routing lattice with the activation lamps driven by real
+  `expert_selected` events (flash 80 / hold 220 / fade 1200 / floor 0.35 /
+  history 8000 ms) and the Matrix rain;
+* right panel: live lamp count, cumulative records, per-layer bars;
+* footer: seq, last-event age, rain state, surface geometry, backend.
+
+Panels that have no data say `unavailable`; surfaces not built at this stage
+say `not implemented this stage` and name what is missing. The v1 stream has no
+token text and no scores, so both are labelled unavailable rather than faked.
+Expert *residency* is not in the v1 stream either, so the lattice is drawn as
+geometry only (real 48 × 512 dimensions from `meta`) and no residency is
+painted.
+
+## Present-on-demand
+
+With rain off the app runs `ControlFlow::Wait`: it redraws only when a collector
+line arrives, when the connection state changes, or while a lamp is still
+decaying (capped at 60 fps). With no collector and no events it redraws zero
+times — `frames` in the stats dump is the proof.
+
+## Meta
+
+`meta` carries the model name and the trace geometry, and the collector emits
+it once at startup, before a subscriber can be registered; its replay window is
+per session. A client that attaches to a running collector therefore never sees
+`meta`.
+
+The app does not invent a model name. If no `meta` arrived, the header says
+`MODEL unavailable — no meta event`, and with `--meta-db <collector.sqlite>` it
+reads back the collector's own recorded `meta` line (read-only, one row, same
+parser) and labels it `collector store` in the UI and `meta_source:
+"collector-store"` in the dump. `meta_source: "socket"` means it came over the
+wire.
+
+## Stats dump
+
+`--stats <path|->` writes a JSON counter dump every `--stats-ms` (default
+1000 ms) from a dedicated thread, so the window can stay idle. It contains
+`events_by_type`, `passes`, `positions`, `records`, per-session counters and
+their `request_delta`, `gaps_seen`/`gap_reasons`, `drops` (ours and
+collector-wide), `replay_seen`/`replay_truncated_seen`, seq totals and gaps,
+the latest `perf`/`hw`/`status` samples, per-layer activation totals, the
+hottest experts, and `frames`/`redraw_requests`.
+
+## Connection lifecycle
+
+The socket reader reconnects every 50 ms while the collector is down, reports
+the disconnect the moment the socket closes (`kill -9` included), and on
+reconnect consumes the collector's replay preload. Replayed events whose seq is
+already counted are ignored (`events_ignored_dup`) instead of double counted; a
+seq jump is counted as `seq_gaps`/`seq_missing` and the collector's own
+`replay_truncated` for our subscriber is surfaced verbatim. A collector
+restarted against a fresh database re-bases `seq`; the app detects that from the
+`run_id` in `meta` or from fresh timestamps (`seq_rebaselines`) rather than
+mistaking the new stream for duplicates.

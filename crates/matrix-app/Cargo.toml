@@ -1,0 +1,19 @@
+[package]
+name = "matrix-app"
+version = "0.1.0"
+edition = "2024"
+description = "THE MATRIX Stage 4 native application: collector client + wgpu grid/rain renderer."
+
+# Versions are PINNED to the proven bench-A harness
+# (/srv/storage/work/the-matrix-bench/harness-a-wgpu/Cargo.toml) so the renderer
+# that was measured at 0.16 ms/frame is the renderer shipped here.
+[dependencies]
+wgpu = "=30.0.1"
+winit = "=0.30.13"
+pollster = "=0.4.0"
+ab_glyph = "=0.2.32"
+bytemuck = { version = "=1.25.2", features = ["derive"] }
+
+[[bin]]
+name = "matrix-app"
+path = "src/main.rs"
