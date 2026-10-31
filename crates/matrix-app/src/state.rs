@@ -251,6 +251,25 @@ impl State {
         self.sessions.iter_mut().find(|s| s.id == id)
     }
 
+    /// A client that attaches mid-session never sees `session_started` (the
+    /// collector's replay window starts at the session tail), so the session
+    /// entry is created lazily from the first event carrying that id. Counters
+    /// stay per-session instead of being dropped on the floor.
+    fn ensure_session(&mut self, id: &str, ts: f64) {
+        if self.sessions.iter().any(|s| s.id == id) {
+            return;
+        }
+        if self.sessions.len() >= MAX_SESSIONS {
+            self.sessions.remove(0);
+        }
+        let mut s = Session::new(id, ts);
+        s.tier = "unknown".into();
+        self.sessions.push(s);
+        if self.current_session.is_none() {
+            self.current_session = Some(id.to_string());
+        }
+    }
+
     /// Apply one NDJSON line. Returns the activation to hand to the renderer
     /// (pass_index, layer, expert ids) when the line was an expert_selected
     /// event.
@@ -407,6 +426,7 @@ impl State {
                     self.skipped_bytes_seen += sk as u64;
                 }
                 if let Some(id) = sess.as_ref() {
+                    self.ensure_session(id, ts);
                     if let Some(s) = self.session_mut(id) {
                         s.seen_passes += 1;
                         s.seen_positions += pc;
@@ -432,6 +452,7 @@ impl State {
                     self.layer_counts[layer as usize] += 1;
                 }
                 if let Some(id) = sess.as_ref() {
+                    self.ensure_session(id, ts);
                     if let Some(s) = self.session_mut(id) {
                         s.seen_records += 1;
                     }

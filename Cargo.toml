@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/matrix-collect"]
+members = ["crates/matrix-collect", "crates/matrix-app"]
 resolver = "3"
 
 # Runtime profiles live at the workspace root. The collector's original

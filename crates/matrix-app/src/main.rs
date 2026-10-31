@@ -323,6 +323,7 @@ impl ApplicationHandler<()> for App {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         if STOP.load(Ordering::SeqCst) {
+            eprintln!("signal: about_to_wait sees STOP, exiting");
             el.exit();
             return;
         }
@@ -537,7 +538,26 @@ fn main() {
         args,
     };
     let proxy = event_loop.create_proxy();
-    app.spawn_client(proxy);
+    app.spawn_client(proxy.clone());
+    // The event loop blocks in ControlFlow::Wait when nothing is animating, so a
+    // signal alone cannot wake it. A 150 ms watcher turns STOP into one user
+    // event, which lets about_to_wait() exit cleanly — no periodic redraws.
+    {
+        let p = proxy.clone();
+        std::thread::spawn(move || {
+            loop {
+                if STOP.load(Ordering::SeqCst) {
+                    eprintln!("signal: STOP observed, waking the event loop");
+                    match p.send_event(()) {
+                        Ok(_) => eprintln!("signal: wake event sent"),
+                        Err(e) => eprintln!("signal: wake failed: {e:?}"),
+                    }
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+        });
+    }
     eprintln!("matrix-app: socket {} · stats {:?} · rain {}",
         app.args.socket, app.args.stats, app.args.rain);
     event_loop.run_app(&mut app).expect("run_app");
