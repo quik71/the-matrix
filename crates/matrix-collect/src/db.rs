@@ -539,6 +539,25 @@ impl Store {
             .map_err(|e| e.to_string())
     }
 
+    /// The most recent `gap` lines, oldest first. Gap events carry no session,
+    /// so a subscriber that attaches later would otherwise never learn that the
+    /// collector lost or skipped bytes before it connected.
+    pub fn recent_gaps(&self, limit: usize) -> Result<Vec<String>, String> {
+        let mut st = self
+            .conn
+            .prepare("SELECT line FROM events WHERE kind='gap' ORDER BY seq DESC LIMIT ?1")
+            .map_err(|e| e.to_string())?;
+        let it = st
+            .query_map(params![limit as i64], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for l in it {
+            out.push(l.map_err(|e| e.to_string())?);
+        }
+        out.reverse();
+        Ok(out)
+    }
+
     pub fn wal_bytes(&self) -> u64 {
         std::fs::metadata(format!("{}-wal", self.db_path))
             .map(|m| m.len())

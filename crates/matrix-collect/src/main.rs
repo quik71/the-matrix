@@ -346,6 +346,12 @@ struct Core {
     engine_errors: u64,
     reg_rx: std::sync::mpsc::Receiver<Arc<Sub>>,
     last_finished: Option<String>,
+    /// The exact `meta` line this run emitted. Every subscriber that connects
+    /// later gets this line as the first entry of its replay preload, so a late
+    /// client can learn the model geometry without reading the DB or guessing.
+    /// Additive to the v1 contract: the line is byte-identical to the one in the
+    /// store, and a subscriber that was already attached never sees a second one.
+    meta_line: Option<String>,
 }
 
 impl Core {
@@ -363,6 +369,9 @@ impl Core {
         }
         line.push_str(body);
         line.push('}');
+        if kind == "meta" {
+            self.meta_line = Some(line.clone());
+        }
         self.events_total += 1;
         {
             let subs = self.subs.lock().unwrap_or_else(|p| p.into_inner());
@@ -983,6 +992,35 @@ impl Core {
                     lines = pairs.into_iter().map(|(_, l)| l).collect();
                 }
             }
+            // meta-on-connect (additive): a subscriber that attaches after the
+            // collector started never saw the startup `meta` event. Hand it the
+            // stored line first — exactly the bytes that were recorded, counted
+            // in this subscriber's replayed total.
+            if let Some(ml) = self.meta_line.clone() {
+                let already = lines.iter().any(|l| l.contains("\"type\":\"meta\""));
+                if !already {
+                    lines.insert(0, ml);
+                    eprintln!("subscriber {}: meta-on-connect ({} bytes)", sub.name, lines[0].len());
+                }
+            }
+            // Gaps that happened before this subscriber attached (a restart, a
+            // discarded pass). Additive like meta-on-connect: the bytes are the
+            // recorded ones, and a fresh subscriber sees at most 8 of them.
+            if let Some(st) = self.store.as_ref() {
+                if let Ok(gaps) = st.recent_gaps(8) {
+                    let mut at = 1usize.min(lines.len());
+                    for g in gaps {
+                        if lines.iter().any(|l| l == &g) {
+                            continue;
+                        }
+                        lines.insert(at, g);
+                        at += 1;
+                    }
+                    if at > 1 {
+                        eprintln!("subscriber {}: {} recent gap event(s) on connect", sub.name, at - 1);
+                    }
+                }
+            }
             if !lines.is_empty() || trunc > 0 {
                 eprintln!(
                     "subscriber {}: preload {} line(s) of {:?}, truncated {}, floor {}",
@@ -1249,6 +1287,7 @@ fn main() {
         engine_errors: 0,
         reg_rx,
         last_finished: None,
+        meta_line: None,
     };
 
     // Resume seq from storage so seq stays monotonic across restarts.

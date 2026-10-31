@@ -2,6 +2,11 @@
 // unix socket. The app never reads the engine, the trace, or the collector's
 // SQLite file — if a field is not in the event stream it is reported as
 // unavailable instead of being invented.
+//
+// Stage 5 extends this with what the panels actually display: the full session
+// list (tier labels, exact per-session counts), the latest perf sample plus a
+// short history of real samples, the stream-health counters and the hardware
+// sample. Nothing here is derived from a model, a fixture or a guess.
 
 use std::collections::HashMap;
 
@@ -10,12 +15,16 @@ use crate::json::{self, Value};
 pub const EXPERT_SLOTS: usize = 512;
 pub const LAYER_SLOTS: usize = 48;
 pub const MAX_SESSIONS: usize = 512;
+pub const PERF_HIST: usize = 240;
+pub const MAX_GAPS: usize = 24;
+pub const HOT_N: usize = 10;
 
 #[derive(Clone)]
 pub struct Session {
     pub id: String,
     pub tier: String,
     pub started_ts: f64,
+    pub duration_s: f64,
     pub finished: bool,
     pub end_reason: String,
     pub requests_before: i64,
@@ -24,6 +33,8 @@ pub struct Session {
     pub passes: i64,
     pub positions: i64,
     pub records: i64,
+    pub trace_bytes: i64,
+    pub first_seq: i64,
     pub seen_passes: u64,
     pub seen_positions: u64,
     pub seen_records: u64,
@@ -35,6 +46,7 @@ impl Session {
             id: id.to_string(),
             tier: "unknown".into(),
             started_ts,
+            duration_s: -1.0,
             finished: false,
             end_reason: String::new(),
             requests_before: -1,
@@ -43,6 +55,8 @@ impl Session {
             passes: -1,
             positions: -1,
             records: -1,
+            trace_bytes: -1,
+            first_seq: -1,
             seen_passes: 0,
             seen_positions: 0,
             seen_records: 0,
@@ -63,6 +77,10 @@ pub struct Perf {
     pub output_tokens: i64,
     pub drafts_offered: i64,
     pub drafts_accepted: i64,
+    pub delta_requests: i64,
+    pub delta_prompt: i64,
+    pub delta_output: i64,
+    pub delta_drafts: i64,
 }
 
 #[derive(Clone, Default)]
@@ -75,6 +93,34 @@ pub struct Hw {
     pub power_w: Option<f64>,
     pub load1: Option<f64>,
     pub mem_available_mib: Option<f64>,
+    pub rss_kib: Option<i64>,
+}
+
+#[derive(Clone, Default)]
+pub struct SubRow {
+    pub id: i64,
+    pub name: String,
+    pub peer: String,
+    pub since: f64,
+    pub depth: i64,
+    pub max_depth: i64,
+    pub sent: i64,
+    pub dropped: i64,
+    pub forced: i64,
+    pub replayed: i64,
+    pub truncated: i64,
+    pub bytes_out: i64,
+    pub closed: bool,
+}
+
+#[derive(Clone, Default)]
+pub struct GapRow {
+    pub ts: f64,
+    pub reason: String,
+    pub bytes: i64,
+    pub records_unattributed: i64,
+    pub detail: String,
+    pub session: String,
 }
 
 #[derive(Clone, Default)]
@@ -90,14 +136,28 @@ pub struct Status {
     pub queue_cap: i64,
     pub drops_total: i64,
     pub skipped_bytes_total: i64,
+    pub skipped_since_last: i64,
     pub resyncs_total: i64,
     pub discarded_passes: i64,
     pub gap_bytes_total: i64,
+    pub replay_max: i64,
     pub engine_ok: bool,
     pub engine_state: String,
     pub engine_requests_total: i64,
+    pub engine_errors: i64,
     pub session_active: bool,
     pub unattributed_requests: i64,
+    pub trace_offset: i64,
+    pub trace_anchor: i64,
+    pub held_records: i64,
+    pub file_size: i64,
+    pub db_ok: bool,
+    pub db_enabled: bool,
+    pub db_wal_bytes: i64,
+    pub db_max_seq: i64,
+    pub db_last_commit_ms: f64,
+    pub db_error: String,
+    pub subs: Vec<SubRow>,
     // our own subscriber's row in per_subscriber[], matched at connect time
     pub sub_id: Option<i64>,
     pub sub_depth: i64,
@@ -110,6 +170,22 @@ pub struct Status {
     pub sub_bytes_out: i64,
 }
 
+/// Where the compositor actually put the window (read back from hyprctl, never
+/// assumed). Filled in once the WM has mapped and fullscreened the surface.
+#[derive(Clone, Default)]
+pub struct Placement {
+    pub requested: String,   // --monitor value, or "active" when not given
+    pub monitor: String,     // monitor name hyprctl reports for this window
+    pub monitor_id: i64,
+    pub x: i64,
+    pub y: i64,
+    pub w: i64,
+    pub h: i64,
+    pub fullscreen: i64,
+    pub verified: bool,
+    pub note: String,
+}
+
 pub struct State {
     pub pid: u32,
     pub socket: String,
@@ -120,6 +196,7 @@ pub struct State {
     pub connects: u64,
     pub disconnects: u64,
     pub connect_errors: u64,
+    pub connect_error_wall: f64,
     pub connected_since: f64,
     pub connect_wall: f64, // wall clock of the connect currently in effect
     pub last_disconnect_reason: String,
@@ -132,13 +209,17 @@ pub struct State {
     pub run_id: Option<String>,
     pub layers: usize,
     pub experts: usize,
+    pub k: i64,
     pub engine_name: Option<String>, // meta.engine.engine (version) — never the API key
-    pub meta_raw_engine_state: Option<String>,
+    /// meta.engine rendered back to JSON (already parsed, no key in it: the
+    /// collector's meta whitelists engine fields and the key is not one of them)
+    pub engine_block: Option<String>,
     /// Where the model geometry came from: "socket" when the collector's own
     /// `meta` event arrived live, "collector-store" when it was read back from
-    /// the collector's recorded meta row (see render/main note), None if the app
-    /// has no meta at all — in which case the UI says unavailable.
+    /// the collector's recorded meta row, None if the app has no meta at all —
+    /// in which case the UI says unavailable.
     pub meta_source: Option<String>,
+    pub meta_events: u64,
 
     // stream accounting
     pub events_total: u64,
@@ -165,12 +246,15 @@ pub struct State {
     pub gaps_seen: u64,
     pub gap_reasons: HashMap<String, u64>,
     pub gap_bytes: u64,
+    pub gaps: Vec<GapRow>,
     pub skipped_bytes_seen: u64,
     pub replay_seen: u64,
     pub replay_truncated_seen: u64,
 
     // latest samples
     pub perf: Option<Perf>,
+    pub perf_hist: Vec<(f64, Option<f64>)>, // (ts, live.tok_s) — real samples only
+    pub perf_samples: u64,
     pub hw: Option<Hw>,
     pub status: Option<Status>,
 
@@ -178,9 +262,20 @@ pub struct State {
     pub layer_counts: Vec<u64>,
     pub expert_counts: Vec<u64>,
 
+    // view / selection (Stage 5 panels)
+    pub view: u8,
+    pub sel_layer: usize,
+    pub sel_pinned: bool,
+    pub last_active_layer: Option<usize>,
+
+    // window placement read back from the compositor
+    pub placement: Placement,
+
     // render facts (proves present-on-demand behaviour)
     pub frames: u64,
     pub redraw_requests: u64,
+    pub repaints_unchanged: u64,
+    pub wakes_skipped: u64,
     pub last_frame: crate::render::FrameStats,
     pub rain: bool,
 }
@@ -195,6 +290,7 @@ impl State {
             connects: 0,
             disconnects: 0,
             connect_errors: 0,
+            connect_error_wall: 0.0,
             connected_since: 0.0,
             connect_wall: 0.0,
             last_disconnect_reason: String::new(),
@@ -205,9 +301,11 @@ impl State {
             run_id: None,
             layers: LAYER_SLOTS,
             experts: EXPERT_SLOTS,
+            k: 0,
             engine_name: None,
-            meta_raw_engine_state: None,
+            engine_block: None,
             meta_source: None,
+            meta_events: 0,
             events_total: 0,
             by_type: HashMap::new(),
             events_ignored_dup: 0,
@@ -228,16 +326,26 @@ impl State {
             gaps_seen: 0,
             gap_reasons: HashMap::new(),
             gap_bytes: 0,
+            gaps: Vec::new(),
             skipped_bytes_seen: 0,
             replay_seen: 0,
             replay_truncated_seen: 0,
             perf: None,
+            perf_hist: Vec::new(),
+            perf_samples: 0,
             hw: None,
             status: None,
             layer_counts: vec![0; LAYER_SLOTS],
             expert_counts: vec![0; EXPERT_SLOTS],
+            view: 0,
+            sel_layer: 0,
+            sel_pinned: false,
+            last_active_layer: None,
+            placement: Placement::default(),
             frames: 0,
             redraw_requests: 0,
+            repaints_unchanged: 0,
+            wakes_skipped: 0,
             last_frame: Default::default(),
             rain,
         }
@@ -268,6 +376,150 @@ impl State {
         if self.current_session.is_none() {
             self.current_session = Some(id.to_string());
         }
+    }
+
+    /// Every displayed value, hashed (sample timestamps are NOT hashed: a
+    /// sample that repeats the same values must not cause a frame). The event
+    /// loop repaints only when this
+    /// changes (or while a lamp is still fading or the rain is running), which
+    /// is what makes an idle, rain-off window present zero frames: a retry that
+    /// does not change a single visible value produces no frame at all.
+    pub fn fingerprint(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        self.view.hash(&mut h);
+        self.sel_layer.hash(&mut h);
+        self.rain.hash(&mut h);
+        self.connected.hash(&mut h);
+        self.connect_errors.hash(&mut h);
+        self.meta_source.hash(&mut h);
+        self.meta_events.hash(&mut h);
+        self.model.hash(&mut h);
+        self.engine_name.hash(&mut h);
+        self.layers.hash(&mut h);
+        self.experts.hash(&mut h);
+        self.k.hash(&mut h);
+        self.collector_version.hash(&mut h);
+        self.run_id.hash(&mut h);
+        self.last_seq.hash(&mut h);
+        self.last_event_ts.to_bits().hash(&mut h);
+        self.passes.hash(&mut h);
+        self.positions.hash(&mut h);
+        self.records.hash(&mut h);
+        self.sessions_started.hash(&mut h);
+        self.sessions_finished.hash(&mut h);
+        self.current_session.hash(&mut h);
+        self.seq_gaps.hash(&mut h);
+        self.seq_missing.hash(&mut h);
+        self.seq_rebaselines.hash(&mut h);
+        self.gaps_seen.hash(&mut h);
+        self.gap_bytes.hash(&mut h);
+        self.skipped_bytes_seen.hash(&mut h);
+        self.replay_seen.hash(&mut h);
+        self.replay_truncated_seen.hash(&mut h);
+        self.placement.monitor.hash(&mut h);
+        self.placement.verified.hash(&mut h);
+        self.placement.w.hash(&mut h);
+        self.placement.h.hash(&mut h);
+        self.layer_counts.hash(&mut h);
+        self.expert_counts.hash(&mut h);
+        self.sessions.len().hash(&mut h);
+        for s in self.sessions.iter().rev().take(24) {
+            s.id.hash(&mut h);
+            s.tier.hash(&mut h);
+            s.finished.hash(&mut h);
+            s.end_reason.hash(&mut h);
+            s.request_delta.hash(&mut h);
+            s.requests_before.hash(&mut h);
+            s.requests_after.hash(&mut h);
+            s.seen_passes.hash(&mut h);
+            s.seen_positions.hash(&mut h);
+            s.seen_records.hash(&mut h);
+            s.passes.hash(&mut h);
+            s.positions.hash(&mut h);
+            s.records.hash(&mut h);
+            s.duration_s.to_bits().hash(&mut h);
+        }
+        if let Some(p) = &self.perf {
+            p.engine_ok.hash(&mut h);
+            p.error.hash(&mut h);
+            p.baseline.hash(&mut h);
+            p.state.hash(&mut h);
+            p.tok_s.map(|v| v.to_bits()).hash(&mut h);
+            p.requests.hash(&mut h);
+            p.prompt_tokens.hash(&mut h);
+            p.output_tokens.hash(&mut h);
+            p.drafts_offered.hash(&mut h);
+            p.drafts_accepted.hash(&mut h);
+            p.delta_requests.hash(&mut h);
+            p.delta_output.hash(&mut h);
+        } else {
+            0u8.hash(&mut h);
+        }
+        if let Some(x) = &self.hw {
+            x.gpu_name.hash(&mut h);
+            x.util_pct.map(|v| v.to_bits()).hash(&mut h);
+            x.mem_used_mib.map(|v| v.to_bits()).hash(&mut h);
+            x.temp_c.map(|v| v.to_bits()).hash(&mut h);
+            x.power_w.map(|v| v.to_bits()).hash(&mut h);
+            x.load1.map(|v| v.to_bits()).hash(&mut h);
+            x.mem_available_mib.map(|v| v.to_bits()).hash(&mut h);
+        } else {
+            1u8.hash(&mut h);
+        }
+        if let Some(s) = &self.status {
+            s.events_per_s.to_bits().hash(&mut h);
+            s.records_per_s.to_bits().hash(&mut h);
+            s.bytes_per_s.to_bits().hash(&mut h);
+            s.events_total.hash(&mut h);
+            s.sessions_total.hash(&mut h);
+            s.subscribers.hash(&mut h);
+            s.queue_cap.hash(&mut h);
+            s.drops_total.hash(&mut h);
+            s.skipped_bytes_total.hash(&mut h);
+            s.resyncs_total.hash(&mut h);
+            s.discarded_passes.hash(&mut h);
+            s.gap_bytes_total.hash(&mut h);
+            s.engine_ok.hash(&mut h);
+            s.engine_state.hash(&mut h);
+            s.engine_requests_total.hash(&mut h);
+            s.engine_errors.hash(&mut h);
+            s.session_active.hash(&mut h);
+            s.unattributed_requests.hash(&mut h);
+            s.db_ok.hash(&mut h);
+            s.db_wal_bytes.hash(&mut h);
+            s.db_max_seq.hash(&mut h);
+            s.sub_depth.hash(&mut h);
+            s.sub_max_depth.hash(&mut h);
+            s.sub_sent.hash(&mut h);
+            s.sub_dropped.hash(&mut h);
+            s.sub_forced.hash(&mut h);
+            s.sub_replayed.hash(&mut h);
+            s.sub_replay_truncated.hash(&mut h);
+            for r in &s.subs {
+                r.id.hash(&mut h);
+                r.sent.hash(&mut h);
+                r.dropped.hash(&mut h);
+                r.forced.hash(&mut h);
+                r.depth.hash(&mut h);
+                r.closed.hash(&mut h);
+            }
+        } else {
+            2u8.hash(&mut h);
+        }
+        for g in &self.gaps {
+            g.reason.hash(&mut h);
+            g.bytes.hash(&mut h);
+        }
+        h.finish()
+    }
+
+    pub fn hot_experts(&self, n: usize) -> Vec<(usize, u64)> {
+        let mut hot: Vec<(usize, u64)> = self.expert_counts.iter().copied().enumerate().collect();
+        hot.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        hot.truncate(n);
+        hot
     }
 
     /// Apply one NDJSON line. Returns the activation to hand to the renderer
@@ -317,10 +569,16 @@ impl State {
             if let Some(e) = v.path(&["engine", "engine"]).and_then(|s| s.as_str()) {
                 self.engine_name = Some(e.to_string());
             }
+            if let Some(e) = v.get("engine") {
+                self.engine_block = Some(json::render(e));
+            }
             if let Some(l) = v.path(&["trace", "layers"]).and_then(|s| s.as_i64()) {
                 if l > 0 && (l as usize) <= LAYER_SLOTS {
                     self.layers = l as usize;
                 }
+            }
+            if let Some(kk) = v.path(&["trace", "k"]).and_then(|s| s.as_i64()) {
+                self.k = kk;
             }
             if let Some(hi) = v.path(&["trace", "expert_id_range"]).and_then(|a| match a {
                 Value::Arr(x) => x.get(1).and_then(|z| z.as_i64()),
@@ -330,9 +588,18 @@ impl State {
                     self.experts = hi as usize + 1;
                 }
             }
+            self.meta_events += 1;
         }
         if seq >= 0 {
-            if self.last_seq >= 0 && seq <= self.last_seq {
+            // `meta` is re-sent to every subscriber that attaches (additive
+            // meta-on-connect), always carrying the seq it was recorded with, so
+            // it is exempt from the duplicate/ordering filter: it is idempotent
+            // geometry, not a data event. It never moves `last_seq`.
+            // `gap` is a statement about the stream, not a data event: it is
+            // replayed to late subscribers alongside meta, carries its own
+            // byte/record accounting, and never moves `last_seq`.
+            let is_meta = typ == "meta" || typ == "gap";
+            if !is_meta && self.last_seq >= 0 && seq <= self.last_seq {
                 if ts > self.last_ts + 0.001 {
                     // A collector that restarted against a fresh database
                     // re-bases seq at 1. Fresh timestamps prove these are new
@@ -348,16 +615,20 @@ impl State {
                     return None;
                 }
             }
-            if self.last_seq >= 0 && seq != self.last_seq + 1 {
-                self.seq_gaps += 1;
-                self.seq_missing += (seq - self.last_seq - 1).max(0) as u64;
-            }
-            self.last_seq = seq;
-            if seq > self.seq_max_seen {
+            if !is_meta {
+                if self.last_seq >= 0 && seq != self.last_seq + 1 {
+                    self.seq_gaps += 1;
+                    self.seq_missing += (seq - self.last_seq - 1).max(0) as u64;
+                }
+                self.last_seq = seq;
+                if seq > self.seq_max_seen {
+                    self.seq_max_seen = seq;
+                }
+                self.last_ts = ts;
+                self.last_event_ts = ts;
+            } else if seq > self.seq_max_seen {
                 self.seq_max_seen = seq;
             }
-            self.last_ts = ts;
-            self.last_event_ts = ts;
         }
 
         self.events_total += 1;
@@ -373,6 +644,7 @@ impl State {
                     }
                     let mut s = Session::new(&id, ts);
                     s.requests_before = v.get("requests_before").and_then(|z| z.as_i64()).unwrap_or(-1);
+                    s.first_seq = seq;
                     s.tier = v
                         .get("tier_hint")
                         .and_then(|z| z.as_str())
@@ -385,7 +657,7 @@ impl State {
             "session_finished" => {
                 self.sessions_finished += 1;
                 if let Some(id) = sess.clone() {
-                    let (tier, reason, rb, ra, delta, passes, positions, records) = (
+                    let (tier, reason, rb, ra, delta, passes, positions, records, dur, bs, be, fseq) = (
                         v.get("tier").and_then(|z| z.as_str()).unwrap_or("unknown").to_string(),
                         v.get("end_reason").and_then(|z| z.as_str()).unwrap_or("").to_string(),
                         v.get("requests_before").and_then(|z| z.as_i64()).unwrap_or(-1),
@@ -394,6 +666,10 @@ impl State {
                         v.get("passes").and_then(|z| z.as_i64()).unwrap_or(-1),
                         v.get("positions").and_then(|z| z.as_i64()).unwrap_or(-1),
                         v.get("records").and_then(|z| z.as_i64()).unwrap_or(-1),
+                        v.get("duration_s").and_then(|z| z.as_f64()).unwrap_or(-1.0),
+                        v.get("trace_byte_start").and_then(|z| z.as_i64()).unwrap_or(-1),
+                        v.get("trace_byte_end").and_then(|z| z.as_i64()).unwrap_or(-1),
+                        v.get("first_seq").and_then(|z| z.as_i64()).unwrap_or(-1),
                     );
                     if self.session(&id).is_none() {
                         if self.sessions.len() >= MAX_SESSIONS {
@@ -411,6 +687,9 @@ impl State {
                         s.passes = passes;
                         s.positions = positions;
                         s.records = records;
+                        s.duration_s = dur;
+                        s.trace_bytes = if bs >= 0 && be >= bs { be - bs } else { -1 };
+                        s.first_seq = fseq;
                     }
                     if self.current_session.as_deref() == Some(id.as_str()) {
                         self.current_session = None;
@@ -450,6 +729,10 @@ impl State {
                 }
                 if layer >= 0 && (layer as usize) < self.layers {
                     self.layer_counts[layer as usize] += 1;
+                    self.last_active_layer = Some(layer as usize);
+                    if !self.sel_pinned {
+                        self.sel_layer = layer as usize;
+                    }
                 }
                 if let Some(id) = sess.as_ref() {
                     self.ensure_session(id, ts);
@@ -465,7 +748,8 @@ impl State {
             "perf_sample" => {
                 let tot = v.get("totals");
                 let live = v.get("live");
-                self.perf = Some(Perf {
+                let del = v.get("delta");
+                let p = Perf {
                     ts,
                     engine_ok: v.get("engine_ok").and_then(|z| match z {
                         Value::Bool(b) => Some(*b),
@@ -483,7 +767,17 @@ impl State {
                     output_tokens: tot.and_then(|t| t.get("output_tokens")).and_then(|z| z.as_i64()).unwrap_or(0),
                     drafts_offered: tot.and_then(|t| t.get("drafts_offered")).and_then(|z| z.as_i64()).unwrap_or(0),
                     drafts_accepted: tot.and_then(|t| t.get("drafts_accepted")).and_then(|z| z.as_i64()).unwrap_or(0),
-                });
+                    delta_requests: del.and_then(|d| d.get("requests")).and_then(|z| z.as_i64()).unwrap_or(0),
+                    delta_prompt: del.and_then(|d| d.get("prompt_tokens")).and_then(|z| z.as_i64()).unwrap_or(0),
+                    delta_output: del.and_then(|d| d.get("output_tokens")).and_then(|z| z.as_i64()).unwrap_or(0),
+                    delta_drafts: del.and_then(|d| d.get("drafts_offered")).and_then(|z| z.as_i64()).unwrap_or(0),
+                };
+                self.perf_samples += 1;
+                self.perf_hist.push((ts, p.tok_s));
+                if self.perf_hist.len() > PERF_HIST {
+                    self.perf_hist.remove(0);
+                }
+                self.perf = Some(p);
             }
             "hw_sample" => {
                 let mut h = Hw { ts, ..Default::default() };
@@ -496,6 +790,7 @@ impl State {
                 }
                 h.load1 = v.path(&["cpu", "load1"]).and_then(|z| z.as_f64());
                 h.mem_available_mib = v.path(&["mem", "available_mib"]).and_then(|z| z.as_f64());
+                h.rss_kib = v.path(&["proc", "rss_kib"]).and_then(|z| z.as_i64());
                 self.hw = Some(h);
             }
             "telemetry_status" => {
@@ -511,53 +806,87 @@ impl State {
                     queue_cap: v.get("queue_cap").and_then(|z| z.as_i64()).unwrap_or(0),
                     drops_total: v.get("drops_total").and_then(|z| z.as_i64()).unwrap_or(0),
                     skipped_bytes_total: v.get("skipped_bytes_total").and_then(|z| z.as_i64()).unwrap_or(0),
+                    skipped_since_last: v.get("skipped_bytes_since_last_event").and_then(|z| z.as_i64()).unwrap_or(0),
                     resyncs_total: v.get("resyncs_total").and_then(|z| z.as_i64()).unwrap_or(0),
                     discarded_passes: v.get("discarded_passes").and_then(|z| z.as_i64()).unwrap_or(0),
                     gap_bytes_total: v.get("gap_bytes_total").and_then(|z| z.as_i64()).unwrap_or(0),
+                    replay_max: v.get("replay_max").and_then(|z| z.as_i64()).unwrap_or(0),
                     engine_ok: v.path(&["engine", "ok"]).and_then(|z| match z {
                         Value::Bool(b) => Some(*b),
                         _ => None,
                     }).unwrap_or(false),
                     engine_state: v.path(&["engine", "state"]).and_then(|z| z.as_str()).unwrap_or("").to_string(),
                     engine_requests_total: v.path(&["engine", "requests_total"]).and_then(|z| z.as_i64()).unwrap_or(0),
+                    engine_errors: v.path(&["engine", "errors"]).and_then(|z| z.as_i64()).unwrap_or(0),
                     session_active: v.get("session_active").and_then(|z| match z {
                         Value::Bool(b) => Some(*b),
                         _ => None,
                     }).unwrap_or(false),
                     unattributed_requests: v.get("unattributed_requests").and_then(|z| z.as_i64()).unwrap_or(0),
+                    trace_offset: v.path(&["trace", "offset"]).and_then(|z| z.as_i64()).unwrap_or(0),
+                    trace_anchor: v.path(&["trace", "anchor"]).and_then(|z| z.as_i64()).unwrap_or(0),
+                    held_records: v.path(&["trace", "held_records"]).and_then(|z| z.as_i64()).unwrap_or(0),
+                    file_size: v.path(&["trace", "file_size"]).and_then(|z| z.as_i64()).unwrap_or(0),
+                    db_ok: v.path(&["db", "ok"]).and_then(|z| match z {
+                        Value::Bool(b) => Some(*b),
+                        _ => None,
+                    }).unwrap_or(false),
+                    db_enabled: v.path(&["db", "enabled"]).and_then(|z| match z {
+                        Value::Bool(b) => Some(*b),
+                        _ => None,
+                    }).unwrap_or(false),
+                    db_wal_bytes: v.path(&["db", "wal_bytes"]).and_then(|z| z.as_i64()).unwrap_or(0),
+                    db_max_seq: v.path(&["db", "max_seq"]).and_then(|z| z.as_i64()).unwrap_or(0),
+                    db_last_commit_ms: v.path(&["db", "last_commit_ms"]).and_then(|z| z.as_f64()).unwrap_or(0.0),
+                    db_error: v.path(&["db", "error"]).and_then(|z| z.as_str()).unwrap_or("").to_string(),
                     ..Default::default()
                 };
-                // Our own subscriber row: the newest one that registered at or
-                // after the moment this connection was established.
                 if let Some(Value::Arr(list)) = v.get("per_subscriber") {
-                    let mut best: Option<(&Value, i64, f64)> = None;
                     for e in list {
-                        let since = e.get("since").and_then(|z| z.as_f64()).unwrap_or(0.0);
-                        let id = e.get("sub_id").and_then(|z| z.as_i64()).unwrap_or(-1);
-                        if since + 0.5 < self.connect_wall {
+                        s.subs.push(SubRow {
+                            id: e.get("sub_id").and_then(|z| z.as_i64()).unwrap_or(-1),
+                            name: e.get("id").and_then(|z| z.as_str()).unwrap_or("").to_string(),
+                            peer: e.get("conn").and_then(|z| z.as_str()).unwrap_or("").to_string(),
+                            since: e.get("since").and_then(|z| z.as_f64()).unwrap_or(0.0),
+                            depth: e.get("depth").and_then(|z| z.as_i64()).unwrap_or(0),
+                            max_depth: e.get("max_depth").and_then(|z| z.as_i64()).unwrap_or(0),
+                            sent: e.get("sent").and_then(|z| z.as_i64()).unwrap_or(0),
+                            dropped: e.get("dropped_droppable").and_then(|z| z.as_i64()).unwrap_or(0),
+                            forced: e.get("forced_drops").and_then(|z| z.as_i64()).unwrap_or(0),
+                            replayed: e.get("replayed").and_then(|z| z.as_i64()).unwrap_or(0),
+                            truncated: e.get("replay_truncated").and_then(|z| z.as_i64()).unwrap_or(0),
+                            bytes_out: e.get("bytes_out").and_then(|z| z.as_i64()).unwrap_or(0),
+                            closed: matches!(e.get("closed"), Some(Value::Bool(true))),
+                        });
+                    }
+                    // Our own subscriber row: the newest one that registered at
+                    // or after the moment this connection was established.
+                    let mut best: Option<&SubRow> = None;
+                    for e in s.subs.iter() {
+                        if e.since + 0.5 < self.connect_wall {
                             continue;
                         }
                         let better = match best {
                             None => true,
-                            Some((_, bid, bsince)) => id > bid && since >= bsince,
+                            Some(b) => e.id > b.id && e.since >= b.since,
                         };
                         if better {
-                            best = Some((e, id, since));
+                            best = Some(e);
                         }
                     }
-                    if let Some((e, id, _)) = best {
-                        s.sub_id = Some(id);
-                        s.sub_depth = e.get("depth").and_then(|z| z.as_i64()).unwrap_or(0);
-                        s.sub_max_depth = e.get("max_depth").and_then(|z| z.as_i64()).unwrap_or(0);
-                        s.sub_sent = e.get("sent").and_then(|z| z.as_i64()).unwrap_or(0);
-                        s.sub_dropped = e.get("dropped_droppable").and_then(|z| z.as_i64()).unwrap_or(0);
-                        s.sub_forced = e.get("forced_drops").and_then(|z| z.as_i64()).unwrap_or(0);
-                        s.sub_replayed = e.get("replayed").and_then(|z| z.as_i64()).unwrap_or(0);
-                        s.sub_replay_truncated = e.get("replay_truncated").and_then(|z| z.as_i64()).unwrap_or(0);
-                        s.sub_bytes_out = e.get("bytes_out").and_then(|z| z.as_i64()).unwrap_or(0);
-                        self.replay_seen = s.sub_replayed as u64;
-                        if s.sub_replay_truncated > 0 {
-                            self.replay_truncated_seen = s.sub_replay_truncated as u64;
+                    if let Some(e) = best {
+                        s.sub_id = Some(e.id);
+                        s.sub_depth = e.depth;
+                        s.sub_max_depth = e.max_depth;
+                        s.sub_sent = e.sent;
+                        s.sub_dropped = e.dropped;
+                        s.sub_forced = e.forced;
+                        s.sub_replayed = e.replayed;
+                        s.sub_replay_truncated = e.truncated;
+                        s.sub_bytes_out = e.bytes_out;
+                        self.replay_seen = e.replayed as u64;
+                        if e.truncated > 0 {
+                            self.replay_truncated_seen = e.truncated as u64;
                         }
                     }
                 }
@@ -565,9 +894,21 @@ impl State {
             }
             "gap" => {
                 self.gaps_seen += 1;
-                let reason = v.get("reason").and_then(|z| z.as_str()).unwrap_or("unknown");
-                *self.gap_reasons.entry(reason.to_string()).or_insert(0) += 1;
-                self.gap_bytes += v.get("bytes").and_then(|z| z.as_i64()).unwrap_or(0).max(0) as u64;
+                let reason = v.get("reason").and_then(|z| z.as_str()).unwrap_or("unknown").to_string();
+                *self.gap_reasons.entry(reason.clone()).or_insert(0) += 1;
+                let bytes = v.get("bytes").and_then(|z| z.as_i64()).unwrap_or(0).max(0);
+                self.gap_bytes += bytes as u64;
+                self.gaps.push(GapRow {
+                    ts,
+                    reason,
+                    bytes,
+                    records_unattributed: v.get("records_unattributed").and_then(|z| z.as_i64()).unwrap_or(0),
+                    detail: v.get("detail").and_then(|z| z.as_str()).unwrap_or("").to_string(),
+                    session: sess.clone().unwrap_or_default(),
+                });
+                if self.gaps.len() > MAX_GAPS {
+                    self.gaps.remove(0);
+                }
             }
             _ => {}
         }
@@ -576,11 +917,10 @@ impl State {
 
     /// Meta backfill from the collector's own recorded `meta` event.
     ///
-    /// The collector emits `meta` exactly once, immediately after binding its
-    /// socket and before any subscriber can be registered, so a client that
-    /// attaches later never receives it and its replay window is per-session
-    /// only. Rather than invent a model name, the app can read back the very
-    /// line the collector recorded (same JSON, same reader) and labels the
+    /// The collector now replays its stored `meta` line to every subscriber at
+    /// connect (meta-on-connect), so this path is only a fallback for a
+    /// collector old enough to predate that. Rather than invent a model name,
+    /// the app reads back the very line the collector recorded and labels the
     /// result as coming from the collector store.
     pub fn backfill_meta(&mut self, line: &str, source: &str) -> bool {
         let v = match json::parse(line.as_bytes()) {
@@ -599,6 +939,9 @@ impl State {
         if let Some(e) = v.path(&["engine", "engine"]).and_then(|s| s.as_str()) {
             self.engine_name = Some(e.to_string());
         }
+        if let Some(e) = v.get("engine") {
+            self.engine_block = Some(json::render(e));
+        }
         if let Some(r) = v.path(&["collector", "run_id"]).and_then(|s| s.as_str()) {
             if self.run_id.is_none() {
                 self.run_id = Some(r.to_string());
@@ -608,6 +951,9 @@ impl State {
             if l > 0 && (l as usize) <= LAYER_SLOTS {
                 self.layers = l as usize;
             }
+        }
+        if let Some(kk) = v.path(&["trace", "k"]).and_then(|s| s.as_i64()) {
+            self.k = kk;
         }
         if let Some(hi) = v.path(&["trace", "expert_id_range"]).and_then(|a| match a {
             Value::Arr(x) => x.get(1).and_then(|z| z.as_i64()),
@@ -623,15 +969,326 @@ impl State {
         true
     }
 
+    // ------------------------------------------------------- panel inventory
+    /// Per-field inventory of every Stage-5 panel: each field is either live
+    /// (with the value the panel draws) or explicitly unavailable with the
+    /// reason. This is the machine-checkable half of the honesty rule.
+    pub fn panels(&self) -> String {
+        let mut o = String::with_capacity(16384);
+        o.push_str("\"panels\":{");
+
+        // ---- sessions
+        o.push_str("\"sessions\":{\"panel\":\"SESSIONS\",\"source\":\"collector session_started / session_finished / pass_routed / expert_selected\",\"fields\":[");
+        o.push_str(&format!(
+            "{{\"name\":\"session_count\",\"status\":\"live\",\"value\":{}}},\
+             {{\"name\":\"sessions_started\",\"status\":\"live\",\"value\":{}}},\
+             {{\"name\":\"sessions_finished\",\"status\":\"live\",\"value\":{}}},",
+            self.sessions.len(), self.sessions_started, self.sessions_finished
+        ));
+        o.push_str(&format!(
+            "{{\"name\":\"current_session\",\"status\":\"{}\",\"value\":{}}},",
+            if self.current_session.is_some() { "live" } else { "unavailable" },
+            self.current_session.as_ref().map(|s| format!("\"{}\"", json::esc(s))).unwrap_or("null".into())
+        ));
+        let unattributed_sessions = self.sessions.iter().filter(|s| s.tier == "unattributed").count();
+        o.push_str(&format!(
+            "{{\"name\":\"sessions_by_tier\",\"status\":\"live\",\"value\":{{\"windowed\":{},\"unattributed\":{},\"unknown\":{}}}}},",
+            self.sessions.iter().filter(|s| s.tier == "windowed").count(),
+            unattributed_sessions,
+            self.sessions.iter().filter(|s| s.tier == "unknown").count()
+        ));
+        o.push_str(&format!(
+            "{{\"name\":\"unattributed_engine_requests\",\"status\":\"{}\",\"value\":{}}},",
+            if self.status.is_some() { "live" } else { "unavailable" },
+            self.status.as_ref().map(|s| s.unattributed_requests.to_string()).unwrap_or("null".into())
+        ));
+        o.push_str(&format!(
+            "{{\"name\":\"foreign_sessions\",\"status\":\"{}\",\"reason\":\"a session is foreign when its request_delta is 0 or its tier is unattributed: the engine is shared, so any client that writes trace bytes opens a window\"}}",
+            if self.sessions.is_empty() { "unavailable" } else { "live" }
+        ));
+        o.push_str("],\"sessions\":[");
+        for (i, s) in self.sessions.iter().enumerate() {
+            if i > 0 {
+                o.push(',');
+            }
+            o.push_str(&format!(
+                "{{\"id\":\"{}\",\"tier\":\"{}\",\"finished\":{},\"end_reason\":\"{}\",\
+\"request_delta\":{},\"requests_before\":{},\"requests_after\":{},\
+\"passes\":{},\"positions\":{},\"records\":{},\"seen_passes\":{},\"seen_positions\":{},\"seen_records\":{},\
+\"duration_s\":{:.3},\"trace_bytes\":{},\"started_ts\":{:.3}}}",
+                json::esc(&s.id), json::esc(&s.tier), s.finished, json::esc(&s.end_reason),
+                s.request_delta, s.requests_before, s.requests_after,
+                s.passes, s.positions, s.records, s.seen_passes, s.seen_positions, s.seen_records,
+                s.duration_s, s.trace_bytes, s.started_ts
+            ));
+        }
+        o.push_str("]},");
+
+        // ---- activation
+        o.push_str("\"activation\":{\"panel\":\"ACTIVATION\",\"source\":\"collector expert_selected events\",\"fields\":[");
+        o.push_str(&format!(
+            "{{\"name\":\"records\",\"status\":\"live\",\"value\":{}}},\
+             {{\"name\":\"passes\",\"status\":\"live\",\"value\":{}}},\
+             {{\"name\":\"positions\",\"status\":\"live\",\"value\":{}}},\
+             {{\"name\":\"live_lamps\",\"status\":\"live\",\"value\":{}}},\
+             {{\"name\":\"layers_with_activity\",\"status\":\"live\",\"value\":{}}},",
+            self.records, self.passes, self.positions, self.last_frame.lamps,
+            self.layer_counts.iter().filter(|c| **c > 0).count()
+        ));
+        let top = self.layer_counts.iter().copied().max().unwrap_or(0);
+        o.push_str(&format!(
+            "{{\"name\":\"layer_max_selections\",\"status\":\"live\",\"value\":{}}},\
+             {{\"name\":\"selected_layer\",\"status\":\"live\",\"value\":{}}},\
+             {{\"name\":\"selected_layer_selections\",\"status\":\"live\",\"value\":{}}},",
+            top, self.sel_layer, self.layer_counts.get(self.sel_layer).copied().unwrap_or(0)
+        ));
+        o.push_str(
+            "{\"name\":\"expert_residency\",\"status\":\"unavailable\",\"reason\":\"the v1 event stream carries no per-expert residency (VRAM/RAM/SSD); Stage 1 shows only aggregate cache stats, which are not per-expert and are not drawn as residency\"},\
+             {\"name\":\"routing_scores\",\"status\":\"unavailable\",\"reason\":\"serve-path weights are all 0.0 in the trace (ids only), so no score exists to display\"},\
+             {\"name\":\"token_text\",\"status\":\"unavailable\",\"reason\":\"the v1 stream carries pass_index and position but no decoded token text\"},\
+             {\"name\":\"co_activation_matrix\",\"status\":\"unavailable\",\"reason\":\"not implemented in this stage; the events needed (per-pass id sets) are present, the view is not\"},\
+             {\"name\":\"expert_history_replay\",\"status\":\"unavailable\",\"reason\":\"historical playback lands in Stage 7 (SQLite history); the live hint is cumulative since app start\"}\
+            ],\"layer_selections\":[");
+        for (i, c) in self.layer_counts.iter().enumerate() {
+            if i > 0 {
+                o.push(',');
+            }
+            o.push_str(&c.to_string());
+        }
+        o.push_str("],\"hot_experts\":[");
+        for (i, (e, c)) in self.hot_experts(HOT_N).iter().enumerate() {
+            if i > 0 {
+                o.push(',');
+            }
+            o.push_str(&format!("{{\"expert\":{},\"count\":{}}}", e, c));
+        }
+        o.push_str("]},");
+
+        // ---- perf
+        o.push_str("\"perf\":{\"panel\":\"ENGINE PERF\",\"source\":\"collector perf_sample (engine /metrics poll)\",\"fields\":[");
+        match &self.perf {
+            Some(p) => {
+                o.push_str(&format!(
+                    "{{\"name\":\"engine_state\",\"status\":\"live\",\"value\":\"{}\"}},",
+                    json::esc(if p.state.is_empty() { "unknown" } else { &p.state })
+                ));
+                o.push_str(&format!(
+                    "{{\"name\":\"tok_s\",\"status\":\"{}\",\"value\":{}}},",
+                    if p.tok_s.is_some() { "live" } else { "unavailable" },
+                    fmt_opt(p.tok_s)
+                ));
+                o.push_str(&format!(
+                    "{{\"name\":\"requests_total\",\"status\":\"{}\",\"value\":{}}},",
+                    if p.requests.is_some() { "live" } else { "unavailable" },
+                    p.requests.map(|v| v.to_string()).unwrap_or("null".into())
+                ));
+                o.push_str(&format!(
+                    "{{\"name\":\"prompt_tokens\",\"status\":\"live\",\"value\":{}}},\
+                     {{\"name\":\"output_tokens\",\"status\":\"live\",\"value\":{}}},\
+                     {{\"name\":\"drafts_offered\",\"status\":\"live\",\"value\":{}}},\
+                     {{\"name\":\"drafts_accepted\",\"status\":\"live\",\"value\":{}}},\
+                     {{\"name\":\"delta_requests\",\"status\":\"live\",\"value\":{}}},\
+                     {{\"name\":\"delta_output_tokens\",\"status\":\"live\",\"value\":{}}},
+                     {{\"name\":\"delta_drafts_offered\",\"status\":\"live\",\"value\":{}}},\
+                     {{\"name\":\"sample_ts\",\"status\":\"live\",\"value\":{:.3}}},\
+                     {{\"name\":\"samples_seen\",\"status\":\"live\",\"value\":{}}},",
+                    p.prompt_tokens, p.output_tokens, p.drafts_offered, p.drafts_accepted,
+                    p.delta_requests, p.delta_output, p.delta_drafts, p.ts, self.perf_samples
+                ));
+            }
+            None => o.push_str(
+                "{\"name\":\"engine_state\",\"status\":\"unavailable\",\"reason\":\"no perf_sample received yet\"},\
+                 {\"name\":\"tok_s\",\"status\":\"unavailable\",\"reason\":\"no perf_sample received yet\"},",
+            ),
+        }
+        o.push_str(
+            "{\"name\":\"ttft_ms\",\"status\":\"unavailable\",\"reason\":\"perf_sample carries no time-to-first-token field; the collector whitemplates only live.tok_s and totals, so TTFT would have to be invented\"},\
+             {\"name\":\"inter_token_latency_ms\",\"status\":\"unavailable\",\"reason\":\"no per-token timing in the v1 stream\"},\
+             {\"name\":\"prompt_processing_rate\",\"status\":\"unavailable\",\"reason\":\"perf_sample carries prompt_tokens totals but no prefill rate\"},\
+             {\"name\":\"request_duration\",\"status\":\"unavailable\",\"reason\":\"perf_sample carries no per-request duration\"}\
+            ]},");
+
+        // ---- stream health
+        o.push_str("\"stream\":{\"panel\":\"STREAM HEALTH\",\"source\":\"collector telemetry_status / gap events + app-side accounting\",\"fields\":[");
+        o.push_str(&format!(
+            "{{\"name\":\"connected\",\"status\":\"live\",\"value\":{}}},\
+             {{\"name\":\"connects\",\"status\":\"live\",\"value\":{}}},\
+             {{\"name\":\"disconnects\",\"status\":\"live\",\"value\":{}}},\
+             {{\"name\":\"connect_errors\",\"status\":\"live\",\"value\":{}}},\
+             {{\"name\":\"last_seq\",\"status\":\"live\",\"value\":{}}},\
+             {{\"name\":\"seq_gaps\",\"status\":\"live\",\"value\":{}}},\
+             {{\"name\":\"seq_missing\",\"status\":\"live\",\"value\":{}}},\
+             {{\"name\":\"events_seen\",\"status\":\"live\",\"value\":{}}},\
+             {{\"name\":\"records_seen\",\"status\":\"live\",\"value\":{}}},\
+             {{\"name\":\"gap_events\",\"status\":\"live\",\"value\":{}}},\
+             {{\"name\":\"gap_bytes\",\"status\":\"live\",\"value\":{}}},\
+             {{\"name\":\"skipped_bytes_seen\",\"status\":\"live\",\"value\":{}}},",
+            self.connected, self.connects, self.disconnects, self.connect_errors,
+            self.last_seq, self.seq_gaps, self.seq_missing, self.events_total, self.records,
+            self.gaps_seen, self.gap_bytes, self.skipped_bytes_seen
+        ));
+        match &self.status {
+            Some(s) => o.push_str(&format!(
+                "{{\"name\":\"events_per_s\",\"status\":\"live\",\"value\":{:.2}}},\
+                 {{\"name\":\"records_per_s\",\"status\":\"live\",\"value\":{:.2}}},\
+                 {{\"name\":\"bytes_per_s\",\"status\":\"live\",\"value\":{:.0}}},\
+                 {{\"name\":\"queue_depth_ours\",\"status\":\"live\",\"value\":{}}},\
+                 {{\"name\":\"queue_cap\",\"status\":\"live\",\"value\":{}}},\
+                 {{\"name\":\"drops_ours\",\"status\":\"live\",\"value\":{}}},\
+                 {{\"name\":\"forced_drops_ours\",\"status\":\"live\",\"value\":{}}},\
+                 {{\"name\":\"drops_total\",\"status\":\"live\",\"value\":{}}},\
+                 {{\"name\":\"skipped_bytes_total\",\"status\":\"live\",\"value\":{}}},\
+                 {{\"name\":\"resyncs_total\",\"status\":\"live\",\"value\":{}}},\
+                 {{\"name\":\"discarded_passes\",\"status\":\"live\",\"value\":{}}},\
+                 {{\"name\":\"trace_anchor\",\"status\":\"live\",\"value\":{}}},
+                 {{\"name\":\"held_records\",\"status\":\"live\",\"value\":{}}},
+                 {{\"name\":\"file_size\",\"status\":\"live\",\"value\":{}}},
+                 {{\"name\":\"skipped_bytes_since_last_event\",\"status\":\"live\",\"value\":{}}},
+                 {{\"name\":\"engine_errors\",\"status\":\"live\",\"value\":{}}},
+                 {{\"name\":\"replay_max\",\"status\":\"live\",\"value\":{}}},
+                 {{\"name\":\"collector_db_enabled\",\"status\":\"live\",\"value\":{}}},
+                 {{\"name\":\"collector_db_max_seq\",\"status\":\"live\",\"value\":{}}},
+                 {{\"name\":\"collector_db_last_commit_ms\",\"status\":\"live\",\"value\":{:.2}}},
+                 {{\"name\":\"collector_db_error\",\"status\":\"live\",\"value\":\"{}\"}},
+                 {{\"name\":\"replayed_ours\",\"status\":\"live\",\"value\":{}}},\
+                 {{\"name\":\"replay_truncated_ours\",\"status\":\"live\",\"value\":{}}},\
+                 {{\"name\":\"subscribers\",\"status\":\"live\",\"value\":{}}},\
+                 {{\"name\":\"engine_requests_total\",\"status\":\"live\",\"value\":{}}},\
+                 {{\"name\":\"unattributed_requests\",\"status\":\"live\",\"value\":{}}},\
+                 {{\"name\":\"collector_db_ok\",\"status\":\"live\",\"value\":{}}},\
+                 {{\"name\":\"collector_wal_bytes\",\"status\":\"live\",\"value\":{}}},\
+                 {{\"name\":\"trace_offset\",\"status\":\"live\",\"value\":{}}},\
+                 {{\"name\":\"queue_depth_per_subscriber\",\"status\":\"live\",\"value\":{}}},",
+                s.events_per_s, s.records_per_s, s.bytes_per_s, s.sub_depth, s.queue_cap,
+                s.sub_dropped, s.sub_forced, s.drops_total, s.skipped_bytes_total,
+                s.resyncs_total, s.discarded_passes,
+                s.trace_anchor, s.held_records, s.file_size, s.skipped_since_last,
+                s.engine_errors, s.replay_max, s.db_enabled, s.db_max_seq, s.db_last_commit_ms,
+                json::esc(&s.db_error),
+                s.sub_replayed, s.sub_replay_truncated,
+                s.subscribers, s.engine_requests_total, s.unattributed_requests, s.db_ok,
+                s.db_wal_bytes, s.trace_offset, s.subs.len()
+            )),
+            None => o.push_str(
+                "{\"name\":\"telemetry_status\",\"status\":\"unavailable\",\"reason\":\"no telemetry_status received yet\"},",
+            ),
+        }
+        o.push_str(
+            "{\"name\":\"storage_health_sqlite\",\"status\":\"unavailable\",\"reason\":\"the app reads only the collector socket; the collector's own DB block is reported above (db_ok / wal_bytes) but the app does not open the DB\"},\
+             {\"name\":\"per_event_latency\",\"status\":\"unavailable\",\"reason\":\"the app measures frames and counters, not per-event delivery latency\"}\
+            ],\"gaps\":[");
+        for (i, g) in self.gaps.iter().enumerate() {
+            if i > 0 {
+                o.push(',');
+            }
+            o.push_str(&format!(
+                "{{\"ts\":{:.3},\"reason\":\"{}\",\"bytes\":{},\"records_unattributed\":{},\"session\":\"{}\",\"detail\":\"{}\"}}",
+                g.ts, json::esc(&g.reason), g.bytes, g.records_unattributed,
+                json::esc(&g.session), json::esc(&g.detail)
+            ));
+        }
+        o.push_str("],\"subscribers\":[");
+        if let Some(s) = &self.status {
+            for (i, r) in s.subs.iter().enumerate() {
+                if i > 0 {
+                    o.push(',');
+                }
+                o.push_str(&format!(
+                    "{{\"sub_id\":{},\"name\":\"{}\",\"peer\":\"{}\",\"depth\":{},\"max_depth\":{},\"sent\":{},\"dropped_droppable\":{},\"forced_drops\":{},\"replayed\":{},\"replay_truncated\":{},\"bytes_out\":{},\"closed\":{}}}",
+                    r.id, json::esc(&r.name), json::esc(&r.peer), r.depth, r.max_depth, r.sent,
+                    r.dropped, r.forced, r.replayed, r.truncated, r.bytes_out, r.closed
+                ));
+            }
+        }
+        o.push_str("]},");
+
+        // ---- hardware
+        o.push_str("\"hardware\":{\"panel\":\"HARDWARE\",\"source\":\"collector hw_sample (nvidia-smi + /proc)\",\"fields\":[");
+        match &self.hw {
+            Some(h) => o.push_str(&format!(
+                "{{\"name\":\"gpu_name\",\"status\":\"{}\",\"value\":\"{}\"}},\
+                 {{\"name\":\"gpu_util_pct\",\"status\":\"{}\",\"value\":{}}},\
+                 {{\"name\":\"gpu_mem_used_mib\",\"status\":\"{}\",\"value\":{}}},\
+                 {{\"name\":\"gpu_temp_c\",\"status\":\"{}\",\"value\":{}}},\
+                 {{\"name\":\"gpu_power_w\",\"status\":\"{}\",\"value\":{}}},\
+                 {{\"name\":\"load1\",\"status\":\"{}\",\"value\":{}}},\
+                 {{\"name\":\"mem_available_mib\",\"status\":\"{}\",\"value\":{}}},\
+                 {{\"name\":\"collector_rss_kib\",\"status\":\"{}\",\"value\":{}}},",
+                if h.gpu_name.is_empty() { "unavailable" } else { "live" }, json::esc(&h.gpu_name),
+                live_opt(h.util_pct), fmt_opt(h.util_pct),
+                live_opt(h.mem_used_mib), fmt_opt(h.mem_used_mib),
+                live_opt(h.temp_c), fmt_opt(h.temp_c),
+                live_opt(h.power_w), fmt_opt(h.power_w),
+                live_opt(h.load1), fmt_opt(h.load1),
+                live_opt(h.mem_available_mib), fmt_opt(h.mem_available_mib),
+                if h.rss_kib.is_some() { "live" } else { "unavailable" },
+                h.rss_kib.map(|v| v.to_string()).unwrap_or("null".into())
+            )),
+            None => o.push_str(
+                "{\"name\":\"gpu\",\"status\":\"unavailable\",\"reason\":\"no hw_sample received yet\"},",
+            ),
+        }
+        o.push_str(
+            "{\"name\":\"nvme_storage\",\"status\":\"unavailable\",\"reason\":\"hw_sample carries no disk/NVMe fields\"},\
+             {\"name\":\"model_residency_bytes\",\"status\":\"unavailable\",\"reason\":\"no residency telemetry in the v1 stream\"}\
+            ]},");
+
+        // ---- model / geometry
+        o.push_str("\"model\":{\"panel\":\"HEADER\",\"fields\":[");
+        o.push_str(&format!(
+            "{{\"name\":\"model\",\"status\":\"{}\",\"value\":{}}},\
+             {{\"name\":\"meta_source\",\"status\":\"{}\",\"value\":{}}},\
+             {{\"name\":\"collector_version\",\"status\":\"{}\",\"value\":{}}},\
+             {{\"name\":\"schema\",\"status\":\"{}\",\"value\":{}}},\
+             {{\"name\":\"run_id\",\"status\":\"{}\",\"value\":{}}},\
+             {{\"name\":\"engine_version\",\"status\":\"{}\",\"value\":{}}},\
+             {{\"name\":\"layers\",\"status\":\"live\",\"value\":{}}},\
+             {{\"name\":\"experts\",\"status\":\"live\",\"value\":{}}},\
+             {{\"name\":\"top_k\",\"status\":\"{}\",\"value\":{}}},",
+            if self.model.is_some() { "live" } else { "unavailable" }, opt_str(&self.model),
+            if self.meta_source.is_some() { "live" } else { "unavailable" }, opt_str(&self.meta_source),
+            if self.collector_version.is_some() { "live" } else { "unavailable" }, opt_str(&self.collector_version),
+            if self.schema.is_some() { "live" } else { "unavailable" },
+            self.schema.map(|v| v.to_string()).unwrap_or("null".into()),
+            if self.run_id.is_some() { "live" } else { "unavailable" }, opt_str(&self.run_id),
+            if self.engine_name.is_some() { "live" } else { "unavailable" }, opt_str(&self.engine_name),
+            self.layers, self.experts,
+            if self.k > 0 { "live" } else { "unavailable" }, self.k
+        ));
+        o.push_str(
+            "{\"name\":\"model_architecture_detail\",\"status\":\"unavailable\",\"reason\":\"meta carries layer count, top-k and the expert id range only — not the per-layer structure (PLE/QSA/GDN/shared experts)\"}\
+            ],\"engine_block\":");
+        o.push_str(self.engine_block.as_deref().unwrap_or("null"));
+        o.push_str("}");
+
+        o.push_str("},\"unavailable\":[");
+        o.push_str(
+            "{\"field\":\"expert_residency_per_expert\",\"owner\":\"engine instrumentation\",\"reason\":\"no residency events exist in the v1 stream; aggregate GPU memory is shown instead\"},\
+             {\"field\":\"routing_scores_weights\",\"owner\":\"engine\",\"reason\":\"serve-path trace weights are all 0.0 (ids only)\"},\
+             {\"field\":\"token_text\",\"owner\":\"engine\",\"reason\":\"no token text in the v1 stream\"},\
+             {\"field\":\"ttft_and_inter_token_latency\",\"owner\":\"collector\",\"reason\":\"perf_sample exposes live.tok_s and totals, no latency fields\"},\
+             {\"field\":\"prompt_processing_rate\",\"owner\":\"collector\",\"reason\":\"no prefill rate in perf_sample\"},\
+             {\"field\":\"nvme_ssd_metrics\",\"owner\":\"collector\",\"reason\":\"hw_sample has no disk fields\"}\
+            ]");
+        o
+    }
+
     // ---------------------------------------------------------------- dump
     pub fn dump(&self) -> String {
-        let mut o = String::with_capacity(8192);
+        let mut o = String::with_capacity(16384);
         o.push('{');
         o.push_str(&format!("\"pid\":{},\"socket\":\"{}\",\"uptime_s\":{:.3},",
             self.pid, json::esc(&self.socket), crate::now_unix() - self.started_wall));
         o.push_str(&format!("\"connected\":{},\"connects\":{},\"disconnects\":{},\"connect_errors\":{},\"connected_since\":{:.3},\"last_disconnect_reason\":\"{}\",\"reconnects_with_replay\":{},",
             self.connected, self.connects, self.disconnects, self.connect_errors,
             self.connected_since, json::esc(&self.last_disconnect_reason), self.reconnects_with_replay));
+        o.push_str(&format!("\"view\":{},\"sel_layer\":{},\"sel_pinned\":{},", self.view, self.sel_layer, self.sel_pinned));
+        o.push_str("\"placement\":{");
+        o.push_str(&format!("\"requested\":\"{}\",\"monitor\":\"{}\",\"monitor_id\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"fullscreen\":{},\"verified\":{},\"note\":\"{}\"",
+            json::esc(&self.placement.requested), json::esc(&self.placement.monitor), self.placement.monitor_id,
+            self.placement.x, self.placement.y, self.placement.w, self.placement.h,
+            self.placement.fullscreen, self.placement.verified, json::esc(&self.placement.note)));
+        o.push_str("},");
         o.push_str("\"meta\":{");
         o.push_str(&format!("\"model\":{},", opt_str(&self.model)));
         o.push_str(&format!("\"collector_version\":{},", opt_str(&self.collector_version)));
@@ -639,7 +1296,8 @@ impl State {
         o.push_str(&format!("\"run_id\":{},", opt_str(&self.run_id)));
         o.push_str(&format!("\"engine_version\":{},", opt_str(&self.engine_name)));
         o.push_str(&format!("\"meta_source\":{},", opt_str(&self.meta_source)));
-        o.push_str(&format!("\"layers\":{},\"experts\":{}", self.layers, self.experts));
+        o.push_str(&format!("\"meta_events\":{},", self.meta_events));
+        o.push_str(&format!("\"layers\":{},\"experts\":{},\"k\":{}", self.layers, self.experts, self.k));
         o.push_str("},");
         o.push_str(&format!("\"events_total\":{},\"events_ignored_dup\":{},", self.events_total, self.events_ignored_dup));
         o.push_str("\"events_by_type\":{");
@@ -656,7 +1314,8 @@ impl State {
         o.push_str(&format!("\"sessions_started\":{},\"sessions_finished\":{},\"sessions_total_seen\":{},",
             self.sessions_started, self.sessions_finished, self.sessions.len()));
         o.push_str(&format!("\"current_session\":{},", self.current_session.as_ref().map(|s| format!("\"{}\"", json::esc(s))).unwrap_or("null".into())));
-        o.push_str(&format!("\"last_seq\":{},\"seq_gaps\":{},\"seq_missing\":{},\"seq_rebaselines\":{},", self.last_seq, self.seq_gaps, self.seq_missing, self.seq_rebaselines));
+        o.push_str(&format!("\"last_seq\":{},\"seq_gaps\":{},\"seq_missing\":{},\"seq_rebaselines\":{},",
+            self.last_seq, self.seq_gaps, self.seq_missing, self.seq_rebaselines));
         o.push_str(&format!("\"gaps_seen\":{},\"gap_bytes\":{},\"skipped_bytes_seen\":{},\"replay_seen\":{},\"replay_truncated_seen\":{},",
             self.gaps_seen, self.gap_bytes, self.skipped_bytes_seen, self.replay_seen, self.replay_truncated_seen));
         o.push_str("\"gap_reasons\":{");
@@ -677,13 +1336,13 @@ impl State {
                 o.push(',');
             }
             o.push_str(&format!(
-                "{{\"id\":\"{}\",\"tier\":\"{}\",\"finished\":{},\"end_reason\":\"{}\",\"started_ts\":{:.3},\
+                "{{\"id\":\"{}\",\"tier\":\"{}\",\"finished\":{},\"end_reason\":\"{}\",\"started_ts\":{:.3},\"duration_s\":{:.3},\
 \"requests_before\":{},\"requests_after\":{},\"request_delta\":{},\
-\"passes\":{},\"positions\":{},\"records\":{},\
+\"passes\":{},\"positions\":{},\"records\":{},\"trace_bytes\":{},\"first_seq\":{},\
 \"seen_passes\":{},\"seen_positions\":{},\"seen_records\":{}}}",
-                json::esc(&s.id), json::esc(&s.tier), s.finished, json::esc(&s.end_reason), s.started_ts,
+                json::esc(&s.id), json::esc(&s.tier), s.finished, json::esc(&s.end_reason), s.started_ts, s.duration_s,
                 s.requests_before, s.requests_after, s.request_delta,
-                s.passes, s.positions, s.records,
+                s.passes, s.positions, s.records, s.trace_bytes, s.first_seq,
                 s.seen_passes, s.seen_positions, s.seen_records
             ));
         }
@@ -693,17 +1352,20 @@ impl State {
         match &self.perf {
             Some(p) => o.push_str(&format!(
                 "\"perf\":{{\"ts\":{:.3},\"engine_ok\":{},\"error\":\"{}\",\"baseline\":{},\"state\":\"{}\",\"tok_s\":{},\
-\"requests\":{},\"prompt_tokens\":{},\"output_tokens\":{},\"drafts_offered\":{},\"drafts_accepted\":{}}},",
+\"requests\":{},\"prompt_tokens\":{},\"output_tokens\":{},\"drafts_offered\":{},\"drafts_accepted\":{},\
+\"delta_requests\":{},\"delta_prompt_tokens\":{},\"delta_output_tokens\":{},\"samples\":{}}},",
                 p.ts, p.engine_ok, json::esc(&p.error), p.baseline, json::esc(&p.state),
                 fmt_opt(p.tok_s), p.requests.map(|v| v.to_string()).unwrap_or("null".into()),
-                p.prompt_tokens, p.output_tokens, p.drafts_offered, p.drafts_accepted)),
+                p.prompt_tokens, p.output_tokens, p.drafts_offered, p.drafts_accepted,
+                p.delta_requests, p.delta_prompt, p.delta_output, self.perf_samples)),
             None => o.push_str("\"perf\":null,"),
         }
         match &self.hw {
             Some(h) => o.push_str(&format!(
-                "\"hw\":{{\"ts\":{:.3},\"gpu_name\":\"{}\",\"util_pct\":{},\"mem_used_mib\":{},\"temp_c\":{},\"power_w\":{},\"load1\":{},\"mem_available_mib\":{}}},",
+                "\"hw\":{{\"ts\":{:.3},\"gpu_name\":\"{}\",\"util_pct\":{},\"mem_used_mib\":{},\"temp_c\":{},\"power_w\":{},\"load1\":{},\"mem_available_mib\":{},\"rss_kib\":{}}},",
                 h.ts, json::esc(&h.gpu_name), fmt_opt(h.util_pct), fmt_opt(h.mem_used_mib), fmt_opt(h.temp_c),
-                fmt_opt(h.power_w), fmt_opt(h.load1), fmt_opt(h.mem_available_mib))),
+                fmt_opt(h.power_w), fmt_opt(h.load1), fmt_opt(h.mem_available_mib),
+                h.rss_kib.map(|v| v.to_string()).unwrap_or("null".into()))),
             None => o.push_str("\"hw\":null,"),
         }
         match &self.status {
@@ -711,14 +1373,19 @@ impl State {
                 "\"status\":{{\"ts\":{:.3},\"uptime_s\":{:.1},\"events_per_s\":{:.2},\"records_per_s\":{:.2},\"bytes_per_s\":{:.0},\
 \"subscribers\":{},\"queue_cap\":{},\"drops_total\":{},\"skipped_bytes_total\":{},\"resyncs_total\":{},\"discarded_passes\":{},\
 \"gap_bytes_total\":{},\"engine_ok\":{},\"engine_state\":\"{}\",\"engine_requests_total\":{},\"session_active\":{},\"unattributed_requests\":{},\
-\"events_total_collector\":{},\"sessions_total_collector\":{},\
-\"our_sub\":{{\"sub_id\":{},\"depth\":{},\"max_depth\":{},\"sent\":{},\"dropped_droppable\":{},\"forced_drops\":{},\"replayed\":{},\"replay_truncated\":{},\"bytes_out\":{}}}}},",
+\"events_total_collector\":{},\"sessions_total_collector\":{},\"held_records\":{},\"trace_offset\":{},\"file_size\":{},\"replay_max\":{},\
+\"our_sub\":{{\"sub_id\":{},\"depth\":{},\"max_depth\":{},\"sent\":{},\"dropped_droppable\":{},\"forced_drops\":{},\"replayed\":{},\"replay_truncated\":{},\"bytes_out\":{}}},\
+\"subscribers_detail\":[{}]}},",
                 s.ts, s.uptime_s, s.events_per_s, s.records_per_s, s.bytes_per_s,
                 s.subscribers, s.queue_cap, s.drops_total, s.skipped_bytes_total, s.resyncs_total, s.discarded_passes,
                 s.gap_bytes_total, s.engine_ok, json::esc(&s.engine_state), s.engine_requests_total, s.session_active,
-                s.unattributed_requests, s.events_total, s.sessions_total,
+                s.unattributed_requests, s.events_total, s.sessions_total, s.held_records, s.trace_offset, s.file_size, s.replay_max,
                 s.sub_id.map(|v| v.to_string()).unwrap_or("null".into()), s.sub_depth, s.sub_max_depth, s.sub_sent,
-                s.sub_dropped, s.sub_forced, s.sub_replayed, s.sub_replay_truncated, s.sub_bytes_out)),
+                s.sub_dropped, s.sub_forced, s.sub_replayed, s.sub_replay_truncated, s.sub_bytes_out,
+                s.subs.iter().map(|r| format!(
+                    "{{\"sub_id\":{},\"name\":\"{}\",\"depth\":{},\"sent\":{},\"dropped_droppable\":{},\"forced_drops\":{},\"replayed\":{},\"replay_truncated\":{},\"closed\":{}}}",
+                    r.id, json::esc(&r.name), r.depth, r.sent, r.dropped, r.forced, r.replayed, r.truncated, r.closed
+                )).collect::<Vec<_>>().join(","))),
             None => o.push_str("\"status\":null,"),
         }
 
@@ -730,22 +1397,35 @@ impl State {
             o.push_str(&c.to_string());
         }
         o.push_str("],\"expert_hot\":[");
-        let mut hot: Vec<(usize, u64)> = self.expert_counts.iter().copied().enumerate().collect();
-        hot.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        for (i, (e, c)) in hot.iter().take(8).enumerate() {
+        for (i, (e, c)) in self.hot_experts(8).iter().enumerate() {
             if i > 0 {
                 o.push(',');
             }
             o.push_str(&format!("{{\"expert\":{},\"count\":{}}}", e, c));
         }
+        o.push_str("],\"perf_hist\":[");
+        let start = self.perf_hist.len().saturating_sub(120);
+        for (i, (ts, tok)) in self.perf_hist[start..].iter().enumerate() {
+            if i > 0 {
+                o.push(',');
+            }
+            o.push_str(&format!("[{:.1},{}]", ts, fmt_opt(*tok)));
+        }
         o.push_str("],");
 
-        o.push_str(&format!("\"rain\":{},\"frames\":{},\"redraw_requests\":{},\"last_frame\":{{\"quads\":{},\"glyphs\":{},\"lamps\":{},\"streams\":{}}}",
-            self.rain, self.frames, self.redraw_requests,
+        o.push_str(&self.panels());
+        o.push(',');
+
+        o.push_str(&format!("\"rain\":{},\"frames\":{},\"redraw_requests\":{},\"repaints_unchanged\":{},\"wakes_skipped\":{},\"last_frame\":{{\"quads\":{},\"glyphs\":{},\"lamps\":{},\"streams\":{}}}",
+            self.rain, self.frames, self.redraw_requests, self.repaints_unchanged, self.wakes_skipped,
             self.last_frame.quads, self.last_frame.glyphs, self.last_frame.lamps, self.last_frame.streams));
         o.push('}');
         o
     }
+}
+
+fn live_opt(v: Option<f64>) -> &'static str {
+    if v.is_some() { "live" } else { "unavailable" }
 }
 
 fn opt_str(v: &Option<String>) -> String {

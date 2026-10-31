@@ -1,16 +1,16 @@
-// THE MATRIX Stage 4 — native renderer.
+// THE MATRIX Stage 5 — native renderer.
 //
 // Lifted from the measured bench-A harness (/srv/storage/work/the-matrix-bench/
 // harness-a-wgpu): same wgpu 30 / winit 0.30 pipeline, same instanced-quad
 // geometry, same 48x512 lattice, same Matrix rain, same activation envelope.
-// What changed is the data source: bench A replayed a synthetic fixture, this
-// app draws events that came off the collector's unix socket. Nothing here is
-// simulated — when there is no session, no activation and no telemetry, the
-// frame says exactly that.
+// What changed is the data source (events that came off the collector's unix
+// socket) and the scope: Stage 5 draws the monitoring workstation — lattice,
+// ACTIVATION, SESSIONS, ENGINE PERF, STREAM HEALTH and HARDWARE — from the v1
+// event stream only. Nothing here is simulated: when the stream does not carry
+// a field, the panel says unavailable.
 //
-// Rendering is present-on-demand: with rain off the renderer only draws when a
-// collector line arrives, when the connection state changes, or while a lamp is
-// still decaying. There is no idle redraw loop.
+// Rendering is present-on-demand: the event loop repaints only when a displayed
+// value changes, when a lamp is still decaying, or while the rain runs.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use bytemuck::{Pod, Zeroable};
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
-use crate::state::{State, LAYER_SLOTS};
+use crate::state::{State, EXPERT_SLOTS, LAYER_SLOTS};
 use crate::text::{self, Face};
 
 /* ------------------------------------------------------------------ palette */
@@ -38,8 +38,16 @@ const CELL_OFF: [f32; 4] = [0.239, 0.278, 0.318, 1.0];
 /* ------------------------------------------------------------------ constants */
 
 pub const N_LAYERS: usize = LAYER_SLOTS;
-pub const N_EXPERTS: usize = 512;
+pub const N_EXPERTS: usize = EXPERT_SLOTS;
 
+pub const VIEW_OVERVIEW: u8 = 0;
+pub const VIEW_ACTIVATION: u8 = 1;
+pub const VIEW_SESSIONS: u8 = 2;
+pub const VIEW_PERF: u8 = 3;
+pub const VIEW_STREAM: u8 = 4;
+pub const VIEW_NAMES: [&str; 5] = ["OVERVIEW", "ACTIVATION", "SESSIONS", "PERF", "STREAM"];
+
+const SZ_MICRO: u32 = 11;
 const SZ_SMALL: u32 = 13;
 const SZ_BODY: u32 = 16;
 const SZ_TITLE: u32 = 24;
@@ -64,7 +72,10 @@ const FLASH_IN: f64 = 80.0;
 const HOLD: f64 = 220.0;
 const FADE: f64 = 1200.0;
 const FLOOR: f64 = 0.35;
-const HISTORY_MS: f64 = 8000.0;
+const HISTORY_MS: f64 = 3500.0;
+/// Layer-row activity decays with this time constant (ms) — a real measurement
+/// of recent routing activity per layer, not a decoration.
+const HEAT_TAU: f32 = 1400.0;
 
 /* ------------------------------------------------------------------ gpu types */
 
@@ -104,6 +115,8 @@ pub struct Overlay {
     cur: HashMap<u32, Marker>,
     hist: HashMap<u32, Marker>,
     pass: u32,
+    /// Per-layer recent-activity heat (decays), the lattice's row highlight.
+    pub heat: Vec<f32>,
     pub activated: u64,
     pub expired: u64,
 }
@@ -114,6 +127,7 @@ impl Overlay {
             cur: HashMap::with_capacity(4096),
             hist: HashMap::with_capacity(8192),
             pass: u32::MAX,
+            heat: vec![0.0; N_LAYERS],
             activated: 0,
             expired: 0,
         }
@@ -162,6 +176,7 @@ impl Overlay {
                 mm.t0 = now - FLASH_IN * a as f64;
             }
             self.activated += 1;
+            self.bump_heat(layer);
             return;
         }
         if let Some(mut m) = self.hist.remove(&idx) {
@@ -169,6 +184,7 @@ impl Overlay {
             m.t0 = now - FLASH_IN * a as f64;
             self.cur.insert(idx, m);
             self.activated += 1;
+            self.bump_heat(layer);
             return;
         }
         if self.cur.len() + self.hist.len() >= N_LAYERS * N_EXPERTS {
@@ -179,6 +195,24 @@ impl Overlay {
         }
         self.cur.insert(idx, Marker { layer, expert, t0: now });
         self.activated += 1;
+        self.bump_heat(layer);
+    }
+
+    fn bump_heat(&mut self, layer: u16) {
+        if let Some(h) = self.heat.get_mut(layer as usize) {
+            *h = (*h + 1.0).min(12.0);
+        }
+    }
+
+    /// Time-based decay of the layer-row heat; called once per drawn frame.
+    pub fn decay(&mut self, dt_ms: f32) {
+        let k = (-dt_ms.clamp(0.0, 1000.0) / HEAT_TAU).exp();
+        for h in self.heat.iter_mut() {
+            *h *= k;
+            if *h < 0.01 {
+                *h = 0.0;
+            }
+        }
     }
 
     pub fn tick(&mut self, now: f64) {
@@ -361,54 +395,130 @@ impl Rect {
     fn bottom(&self) -> f32 {
         self.y + self.h
     }
+    fn empty(&self) -> bool {
+        self.w <= 1.0 || self.h <= 1.0
+    }
 }
 
 #[derive(Clone, Copy)]
 pub struct Layout {
     pub w: f32,
     pub h: f32,
+    pub view: u8,
     pub header: Rect,
-    pub left: Rect,
-    pub center: Rect,
-    pub right: Rect,
     pub footer: Rect,
+    pub sessions: Rect,
+    pub activation: Rect,
+    pub lattice_panel: Rect,
+    pub perf: Rect,
+    pub stream: Rect,
+    pub hardware: Rect,
+    pub full: Rect,
     pub grid: Rect,
-    pub cell: f32,
+    pub cell: f32,   // column width
+    pub cell_h: f32, // row height (>= cell when the panel is taller than wide)
 }
 
 impl Layout {
-    pub fn compute(w: f32, h: f32) -> Layout {
+    pub fn compute(w: f32, h: f32, view: u8, layers: usize, experts: usize) -> Layout {
         let pad = 10.0;
-        let header_h = 70.0;
+        let header_h = 78.0;
         let footer_h = 22.0;
-        let side = (w * 0.175).clamp(260.0, 380.0).min((w - 560.0).max(180.0));
         let top = header_h + 4.0;
-        let body_h = (h - top - footer_h - 4.0).max(200.0);
-        let header = Rect { x: pad, y: 6.0, w: (w - 2.0 * pad).max(100.0), h: header_h - 6.0 };
-        let left = Rect { x: pad, y: top, w: side, h: body_h };
-        let right = Rect { x: w - pad - side, y: top, w: side, h: body_h };
-        let center = Rect {
-            x: left.right() + 10.0,
-            y: top,
-            w: (right.x - left.right() - 20.0).max(200.0),
-            h: body_h,
-        };
-        let footer = Rect { x: pad, y: h - footer_h, w: (w - 2.0 * pad).max(100.0), h: footer_h - 2.0 };
+        let bottom_line = (h - footer_h - 2.0).max(top + 120.0);
+        let header = Rect { x: pad, y: 4.0, w: (w - 2.0 * pad).max(100.0), h: header_h - 6.0 };
+        let footer = Rect { x: pad, y: h - footer_h, w: (w - 2.0 * pad).max(100.0), h: footer_h - 4.0 };
+        let body = Rect { x: pad, y: top, w: (w - 2.0 * pad).max(100.0), h: (bottom_line - top).max(120.0) };
 
-        // the lattice fits the centre panel, keeping a layer gutter on the left
-        let gutter = 40.0;
-        let avail_w = (center.w - gutter - 16.0).max(64.0);
-        let avail_h = (center.h - 52.0).max(32.0);
-        let cell = (avail_w / N_EXPERTS as f32).min(avail_h / N_LAYERS as f32).max(0.12);
-        let gw = N_EXPERTS as f32 * cell;
-        let gh = N_LAYERS as f32 * cell;
-        let grid = Rect {
-            x: center.x + gutter + ((avail_w - gw) / 2.0).max(0.0),
-            y: center.y + 38.0 + ((avail_h - gh) / 2.0).max(0.0),
-            w: gw,
-            h: gh,
+        let mut l = Layout {
+            w, h, view, header, footer,
+            sessions: Rect::default(),
+            activation: Rect::default(),
+            lattice_panel: Rect::default(),
+            perf: Rect::default(),
+            stream: Rect::default(),
+            hardware: Rect::default(),
+            full: Rect::default(),
+            grid: Rect::default(),
+            cell: 0.0,
+            cell_h: 0.0,
         };
-        Layout { w, h, header, left, center, right, footer, grid, cell }
+
+        match view {
+            VIEW_OVERVIEW => {
+                let bottom_h = (body.h * 0.27).clamp(170.0, 260.0).min(body.h * 0.45);
+                let main_h = (body.h - bottom_h - 8.0).max(160.0);
+                let side = (w * 0.175).clamp(250.0, 360.0).min(body.w * 0.30);
+                l.sessions = Rect { x: body.x, y: body.y, w: side, h: main_h };
+                l.activation = Rect { x: body.right() - side, y: body.y, w: side, h: main_h };
+                l.lattice_panel = Rect {
+                    x: l.sessions.right() + 8.0,
+                    y: body.y,
+                    w: (l.activation.x - l.sessions.right() - 16.0).max(160.0),
+                    h: main_h,
+                };
+                // bottom row: ENGINE PERF | STREAM HEALTH | HARDWARE
+                let gap = 8.0;
+                let avail = body.w - 2.0 * gap;
+                let pw = (avail * 0.30).max(200.0);
+                let sw = (avail * 0.42).max(240.0);
+                let hw = (avail - pw - sw).max(160.0);
+                let by = body.bottom() - bottom_h;
+                l.perf = Rect { x: body.x, y: by, w: pw, h: bottom_h };
+                l.stream = Rect { x: body.x + pw + gap, y: by, w: sw, h: bottom_h };
+                l.hardware = Rect { x: body.x + pw + sw + 2.0 * gap, y: by, w: hw, h: bottom_h };
+            }
+            VIEW_ACTIVATION => {
+                let lw = (body.w * 0.52).max(320.0);
+                l.lattice_panel = Rect { x: body.x, y: body.y, w: lw, h: body.h };
+                l.activation = Rect { x: body.x + lw + 8.0, y: body.y, w: (body.w - lw - 8.0).max(200.0), h: body.h };
+            }
+            VIEW_SESSIONS => l.full = body,
+            VIEW_PERF => l.full = body,
+            VIEW_STREAM => {
+                let hh = (body.h * 0.34).clamp(150.0, 300.0);
+                l.stream = Rect { x: body.x, y: body.y, w: body.w, h: (body.h - hh - 8.0).max(120.0) };
+                l.hardware = Rect { x: body.x, y: body.y + l.stream.h + 8.0, w: body.w, h: hh };
+            }
+            _ => l.full = body,
+        }
+
+        // the lattice fits its panel, keeping a layer gutter on the left
+        if !l.lattice_panel.empty() {
+            let p = l.lattice_panel;
+            let gutter = 40.0;
+            let avail_w = (p.w - gutter - 18.0).max(64.0);
+            let avail_h = (p.h - 58.0).max(32.0);
+            let cell = (avail_w / experts.max(1) as f32)
+                .min(avail_h / layers.max(1) as f32)
+                .max(0.10);
+            // Rows may be taller than columns (a 48 x 512 lattice is a wall, not
+            // a square): use the panel's height up to 3x the column width so the
+            // rows stay readable, and never distort beyond that.
+            let cell_h = (avail_h / layers.max(1) as f32).min(cell * 3.0).max(cell);
+            let gw = experts.max(1) as f32 * cell;
+            let gh = layers.max(1) as f32 * cell_h;
+            l.grid = Rect {
+                x: p.x + gutter + ((avail_w - gw) / 2.0).max(0.0),
+                y: p.y + 40.0 + ((avail_h - gh) / 2.0).max(0.0),
+                w: gw,
+                h: gh,
+            };
+            l.cell = cell;
+            l.cell_h = cell_h;
+        }
+        l
+    }
+
+    /// Rectangles that get the panel chrome, in draw order.
+    fn chromes(&self) -> Vec<Rect> {
+        let mut v = vec![self.header];
+        for r in [self.sessions, self.activation, self.lattice_panel, self.perf, self.stream, self.hardware, self.full] {
+            if !r.empty() {
+                v.push(r);
+            }
+        }
+        v
     }
 }
 
@@ -427,10 +537,12 @@ struct TextBuf {
     by_size: HashMap<u32, Vec<GInst>>,
 }
 
+const SIZES: [u32; 4] = [SZ_MICRO, SZ_SMALL, SZ_BODY, SZ_TITLE];
+
 impl TextBuf {
     fn new() -> TextBuf {
         let mut by_size = HashMap::new();
-        for px in [SZ_SMALL, SZ_BODY, SZ_TITLE] {
+        for px in SIZES {
             by_size.insert(px, Vec::with_capacity(1024));
         }
         TextBuf { by_size }
@@ -515,6 +627,7 @@ pub struct Renderer {
     lattice: DynBuf,
     lamps: DynBuf,
     bloom: DynBuf,
+    rowheat: DynBuf,
     rain: DynBuf,
     wash: DynBuf,
     chrome: DynBuf,
@@ -526,6 +639,13 @@ pub struct Renderer {
     pub adapter: String,
     pub format: String,
     pub present_mode: String,
+    css: (f32, f32),
+    dim: (usize, usize),
+    /// (x, y, w, h, cell) the cell/gridline quads were built for: any change
+    /// re-uploads them, so the lattice always sits inside its current panel.
+    grid_key: (f32, f32, f32, f32, f32),
+    n_cells: usize,
+    n_lattice: usize,
 }
 
 impl Renderer {
@@ -704,6 +824,7 @@ impl Renderer {
         let lattice = DynBuf::new(&device, &bgl_store, 1200, "lattice");
         let lamps = DynBuf::new(&device, &bgl_store, 8192, "lamps");
         let bloom = DynBuf::new(&device, &bgl_store, 8304, "bloom");
+        let rowheat = DynBuf::new(&device, &bgl_store, 256, "rowheat");
         let rain = DynBuf::new(&device, &bgl_store, 4096, "rain");
         let wash = DynBuf::new(&device, &bgl_store, 1024, "wash");
         let chrome_q = DynBuf::new(&device, &bgl_store, 512, "chrome");
@@ -711,7 +832,7 @@ impl Renderer {
         // ---- glyph faces + per-face text buffers
         let mut text = HashMap::new();
         let mut text_bufs = HashMap::new();
-        for px in [SZ_SMALL, SZ_BODY, SZ_TITLE] {
+        for px in SIZES {
             let face = Face::build(font, px, scale)?;
             let tex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("atlas"),
@@ -765,7 +886,8 @@ impl Renderer {
             text_bufs.insert(px, DynBuf::new(&device, &bgl_store, 2048, "text"));
         }
 
-        let layout = Layout::compute(w as f32 / scale, h as f32 / scale);
+        let css = (w as f32 / scale, h as f32 / scale);
+        let layout = Layout::compute(css.0, css.1, VIEW_OVERVIEW, N_LAYERS, N_EXPERTS);
         queue.write_buffer(&globals_buf, 0, bytemuck::bytes_of(&Globals {
             res: [w as f32, h as f32],
             scale,
@@ -786,6 +908,7 @@ impl Renderer {
             lattice,
             lamps,
             bloom,
+            rowheat,
             rain,
             wash,
             chrome: chrome_q,
@@ -797,13 +920,30 @@ impl Renderer {
             adapter: format!("{} {:?}", info.backend.to_string(), info.name),
             format: format!("{format:?}"),
             present_mode: "Fifo".into(),
+            css,
+            dim: (N_LAYERS, N_EXPERTS),
+            grid_key: (f32::NAN, 0.0, 0.0, 0.0, 0.0),
+            n_cells: 0,
+            n_lattice: (N_EXPERTS + 1) + (N_LAYERS + 1),
         };
-        r.resize(size);
+        r.rebuild_lattice();
         Ok(r)
     }
 
     pub fn face(&self, px: u32) -> &Face {
         &self.text[&px].face
+    }
+
+    /// Recompute the layout for the current CSS size, view and grid dimensions.
+    pub fn relayout(&mut self, view: u8, layers: usize, experts: usize) {
+        self.layout = Layout::compute(self.css.0, self.css.1, view, layers, experts);
+        let g = self.layout.grid;
+        let key = (g.x, g.y, g.w, g.h, self.layout.cell + self.layout.cell_h * 1000.0);
+        if self.dim != (layers, experts) || self.grid_key != key {
+            self.dim = (layers, experts);
+            self.grid_key = key;
+            self.rebuild_lattice();
+        }
     }
 
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -813,29 +953,29 @@ impl Renderer {
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
-        let css_w = size.width as f32 / self.scale;
-        let css_h = size.height as f32 / self.scale;
-        self.layout = Layout::compute(css_w, css_h);
+        self.css = (size.width as f32 / self.scale, size.height as f32 / self.scale);
+        let (v, l, e) = (self.layout.view, self.dim.0, self.dim.1);
+        self.relayout(v, l, e);
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&Globals {
             res: [size.width as f32, size.height as f32],
             scale: self.scale,
             _pad: 0.0,
         }));
-        self.rebuild_lattice();
     }
 
-    /// The residency lattice: one quad per (layer, expert), drawn at the inactive
+    /// The residency lattice: one quad per (layer, expert) at the inactive
     /// colour. Expert residency is not part of the v1 event stream, so the app
-    /// does not paint residency it cannot see; the lattice geometry itself is the
-    /// real 48 x 512 from the collector's `meta` event.
+    /// does not paint residency it cannot see; the lattice geometry is the real
+    /// layers x experts from the collector's `meta` event.
     fn rebuild_lattice(&mut self) {
         let v = self.layout;
-        let mut cell_quads: Vec<Quad> = Vec::with_capacity(N_LAYERS * N_EXPERTS);
-        for layer in 0..N_LAYERS {
-            let y = v.grid.y + (N_LAYERS - 1 - layer) as f32 * v.cell;
-            for e in 0..N_EXPERTS {
+        let (nl, ne) = self.dim;
+        let mut cell_quads: Vec<Quad> = Vec::with_capacity(nl * ne);
+        for layer in 0..nl {
+            let y = v.grid.y + (nl - 1 - layer) as f32 * v.cell_h;
+            for e in 0..ne {
                 cell_quads.push(Quad {
-                    rect: [v.grid.x + e as f32 * v.cell, y, v.cell, v.cell],
+                    rect: [v.grid.x + e as f32 * v.cell, y, v.cell, v.cell_h],
                     color: CELL_OFF,
                 });
             }
@@ -843,24 +983,24 @@ impl Renderer {
         let dev = &self.device;
         let q = &self.queue;
         let lay = &self.store_layout;
-        self.cells.upload(dev, q, &cell_quads, lay, "cells");
+        self.n_cells = self.cells.upload(dev, q, &cell_quads, lay, "cells") as usize;
 
         let mut grid_quads: Vec<Quad> = Vec::with_capacity(1200);
-        for e in 0..=N_EXPERTS {
+        for e in 0..=ne {
             let x = v.grid.x + e as f32 * v.cell;
             grid_quads.push(Quad {
-                rect: [x, v.grid.y, 1.0, N_LAYERS as f32 * v.cell],
+                rect: [x, v.grid.y, 1.0, nl as f32 * v.cell_h],
                 color: [0.0, 0.0, 0.0, 0.55],
             });
         }
-        for l in 0..=N_LAYERS {
-            let y = v.grid.y + l as f32 * v.cell;
+        for l in 0..=nl {
+            let y = v.grid.y + l as f32 * v.cell_h;
             grid_quads.push(Quad {
-                rect: [v.grid.x, y, N_EXPERTS as f32 * v.cell, 1.0],
+                rect: [v.grid.x, y, ne as f32 * v.cell, 1.0],
                 color: [0.0, 0.0, 0.0, 0.55],
             });
         }
-        self.lattice.upload(dev, q, &grid_quads, lay, "lattice");
+        self.n_lattice = self.lattice.upload(dev, q, &grid_quads, lay, "lattice") as usize;
     }
 
     fn push_text(&self, tb: &mut TextBuf, px: u32, x: f32, y: f32, s: &str, color: [f32; 4], max_x: f32) -> f32 {
@@ -869,13 +1009,19 @@ impl Renderer {
         text::push_str(out, face, x, y, s, color, max_x)
     }
 
-    fn row(&self, tb: &mut TextBuf, x: f32, max_x: f32, label: &str, val: &str, col: [f32; 4], y: &mut f32) {
+    /// Left label / right value row, `step` pixels tall.
+    fn row(&self, tb: &mut TextBuf, x: f32, max_x: f32, label: &str, val: &str, col: [f32; 4], y: &mut f32, step: f32) {
         let f = self.face(SZ_BODY);
         let lw = text::text_width(f, label) + 10.0;
         self.push_text(tb, SZ_SMALL, x, *y + 2.0, label, FAINT, max_x);
         let v = text::fit(f, val, (max_x - x - lw).max(20.0));
         self.push_text(tb, SZ_BODY, x + lw, *y, &v, col, max_x);
-        *y += 19.0;
+        *y += step;
+    }
+
+    fn right_text(&self, tb: &mut TextBuf, px: u32, x_right: f32, y: f32, s: &str, col: [f32; 4], max_x: f32) {
+        let w = text::text_width(self.face(px), s);
+        self.push_text(tb, px, (x_right - w).max(x_right - 200.0), y, s, col, max_x);
     }
 
     /// Draw one frame. `now` is milliseconds since app start (visual clock).
@@ -897,80 +1043,52 @@ impl Renderer {
         let mut tb = TextBuf::new();
         let mut lamp_q: Vec<Quad> = Vec::with_capacity(4096);
         let mut bloom_q: Vec<Quad> = Vec::with_capacity(4096);
+        let mut row_q: Vec<Quad> = Vec::with_capacity(256);
         let mut rain_g: Vec<GInst> = Vec::with_capacity(2048);
         let mut wash_g: Vec<GInst> = Vec::with_capacity(1400);
 
         // ---------------------------------------------------------- chrome
-        panel(&mut q, v.header);
-        panel(&mut q, v.left);
-        panel(&mut q, v.center);
-        panel(&mut q, v.right);
+        for r in v.chromes() {
+            panel(&mut q, r);
+        }
 
         // ---------------------------------------------------------- header
-        let hx = v.header.x + 14.0;
-        let tx = self.push_text(&mut tb, SZ_TITLE, hx, v.header.y + 5.0, "THE MATRIX", BRIGHT, v.header.right() - 8.0);
-        self.push_text(&mut tb, SZ_BODY, tx + 16.0, v.header.y + 14.0,
-            "stage 4 · native viewer · live collector socket", DIM, v.header.right() - 8.0);
-
-        let (model_txt, model_col) = match (&st.model, st.meta_source.as_deref()) {
-            (Some(m), Some("collector-store")) => (format!("MODEL {m} · collector store"), DIM),
-            (Some(m), _) => (format!("MODEL {m}"), DIM),
-            (None, _) => ("MODEL unavailable — no meta event".to_string(), AMBER),
-        };
-        let mw = text::text_width(self.face(SZ_SMALL), &model_txt) + 16.0;
-        let mx = v.header.right() - 12.0 - mw;
-        chip(&mut q, Rect { x: mx, y: v.header.y + 8.0, w: mw, h: 24.0 }, model_col);
-        self.push_text(&mut tb, SZ_SMALL, mx + 9.0, v.header.y + 12.0, &model_txt, model_col, v.header.right() - 12.0);
-
-        let mut cx = hx;
-        let (conn_txt, conn_col) = if st.connected {
-            (format!("COLLECTOR CONNECTED  {}", short(&st.socket, 34)), GREEN)
-        } else {
-            ("COLLECTOR NOT CONNECTED — retrying".to_string(), RED)
-        };
-        let row2 = v.header.y + 40.0;
-        cx = chip_text(self, &mut q, &mut tb, cx, row2, &conn_txt, conn_col);
-        let (tel_txt, tel_col) = match &st.status {
-            Some(s) => (
-                format!("TELEMETRY {} · {:.0} ev/s · {:.0} rec/s · drops {} · gaps {} · skipped {} B",
-                    if s.engine_state.is_empty() { "?" } else { &s.engine_state },
-                    s.events_per_s, s.records_per_s, s.drops_total, st.gaps_seen, s.skipped_bytes_total),
-                if s.engine_ok { GREEN } else { AMBER },
-            ),
-            None => ("TELEMETRY unavailable — no telemetry_status yet".to_string(), AMBER),
-        };
-        let _ = chip_text(self, &mut q, &mut tb, cx, row2, &tel_txt, tel_col);
+        self.header(st, &mut q, &mut tb);
 
         // ---------------------------------------------------------- panels
-        self.left_panel(st, &mut q, &mut tb);
-        self.right_panel(st, overlay, &mut q, &mut tb);
+        if !v.sessions.empty() {
+            self.panel_sessions(v.sessions, st, &mut q, &mut tb);
+        }
+        if !v.activation.empty() {
+            self.panel_activation(v.activation, st, overlay, &mut q, &mut tb);
+        }
+        if !v.perf.empty() {
+            self.panel_perf(v.perf, st, &mut q, &mut tb);
+        }
+        if !v.stream.empty() {
+            self.panel_stream(v.stream, st, &mut q, &mut tb);
+        }
+        if !v.hardware.empty() {
+            self.panel_hardware(v.hardware, st, &mut q, &mut tb);
+        }
+        if !v.full.empty() {
+            match v.view {
+                VIEW_SESSIONS => self.panel_sessions(v.full, st, &mut q, &mut tb),
+                VIEW_PERF => self.panel_perf(v.full, st, &mut q, &mut tb),
+                VIEW_STREAM => self.panel_stream(v.full, st, &mut q, &mut tb),
+                _ => self.panel_activation(v.full, st, overlay, &mut q, &mut tb),
+            }
+        }
 
         // ---------------------------------------------------------- centre
-        let gy_top = v.center.y + 8.0;
-        self.push_text(&mut tb, SZ_BODY, v.center.x + 14.0, gy_top,
-            &format!("ROUTING LATTICE · {} layers × {} experts · cell {:.2} px", st.layers, st.experts, v.cell),
-            DIM, v.center.right() - 14.0);
-        for layer in (0..N_LAYERS).step_by(8) {
-            let y = v.grid.y + (N_LAYERS - 1 - layer) as f32 * v.cell + v.cell * 0.5 - 7.0;
-            let s = format!("L{layer:02}");
-            let wpx = text::text_width(self.face(SZ_SMALL), &s);
-            self.push_text(&mut tb, SZ_SMALL, v.grid.x - 8.0 - wpx, y, &s, FAINT, v.center.right());
+        let has_grid = v.cell > 0.0 && !v.lattice_panel.empty();
+        if has_grid {
+            self.lattice(st, overlay, &mut tb, &mut row_q);
         }
-        for e in (0..N_EXPERTS).step_by(64) {
-            let x = v.grid.x + e as f32 * v.cell;
-            self.push_text(&mut tb, SZ_SMALL, x, v.grid.bottom() + 5.0, &format!("{e}"), FAINT, v.center.right());
-        }
-        let cline = match (&st.current_session, st.connected) {
-            (Some(id), _) => format!("live session {} · passes {} · positions {} · records {}", id, st.passes, st.positions, st.records),
-            (None, true) => "no active session — lattice idle, rain continues · no activity is invented".to_string(),
-            (None, false) => "collector not connected — no data to draw".to_string(),
-        };
-        self.push_text(&mut tb, SZ_SMALL, v.center.x + 14.0, v.center.bottom() - 18.0, &cline, DIM, v.center.right() - 14.0);
-        let ftext = self.footer_string(st);
-        self.push_text(&mut tb, SZ_SMALL, v.footer.x + 4.0, v.footer.y + 2.0, &ftext, FAINT, v.footer.right() - 4.0);
+        self.footer(st, &mut tb);
 
         // ---------------------------------------------------------- lamps
-        {
+        if has_grid {
             let mut painted = 0usize;
             let mut bloom_n = 0usize;
             let mut push_lamp = |m: &Marker, a: f32| {
@@ -979,11 +1097,11 @@ impl Renderer {
                 }
                 painted += 1;
                 let x = v.grid.x + m.expert as f32 * v.cell;
-                let y = v.grid.y + (N_LAYERS - 1 - m.layer as usize) as f32 * v.cell;
+                let y = v.grid.y + (self.dim.0 - 1 - m.layer as usize) as f32 * v.cell_h;
                 let g = a * GREEN_MAX;
                 if g >= 0.012 {
                     lamp_q.push(Quad {
-                        rect: [x, y, v.cell.max(1.0), v.cell.max(1.0)],
+                        rect: [x, y, v.cell.max(1.0), v.cell_h.max(1.0)],
                         color: [0.470, 1.0, 0.651, g],
                     });
                 }
@@ -992,7 +1110,7 @@ impl Renderer {
                     let ba = (a - BLOOM_MIN) / (1.0 - BLOOM_MIN);
                     for (ring, alpha) in [(5.0f32, 0.16f32), (2.0, 0.30), (0.0, 0.55)] {
                         bloom_q.push(Quad {
-                            rect: [x - ring, y - ring, v.cell.max(1.0) + 2.0 * ring, v.cell.max(1.0) + 2.0 * ring],
+                            rect: [x - ring, y - ring, v.cell.max(1.0) + 2.0 * ring, v.cell_h.max(1.0) + 2.0 * ring],
                             color: [0.776, 1.0, 0.863, alpha * ba],
                         });
                     }
@@ -1014,7 +1132,9 @@ impl Renderer {
 
         // ---------------------------------------------------------- rain
         let mut streams = 0;
-        if st.rain {
+        // The rain only exists over the lattice: in the data-only views it would
+        // draw glyphs across the tables, which is noise, not decoration.
+        if st.rain && has_grid {
             rain_eng.resize(v.w, v.h);
             rain_eng.update(dt_ms, false);
             streams = rain_eng.streams.len();
@@ -1069,6 +1189,7 @@ impl Renderer {
         // ---------------------------------------------------------- upload + pass
         let nl = self.lamps.upload(&self.device, &self.queue, &lamp_q, &self.store_layout, "lamps");
         let nb = self.bloom.upload(&self.device, &self.queue, &bloom_q, &self.store_layout, "bloom");
+        let nh = self.rowheat.upload(&self.device, &self.queue, &row_q, &self.store_layout, "rowheat");
         let nr = self.rain.upload(&self.device, &self.queue, &rain_g, &self.store_layout, "rain");
         let nw = self.wash.upload(&self.device, &self.queue, &wash_g, &self.store_layout, "wash");
         let nq = self.chrome.upload(&self.device, &self.queue, &q, &self.store_layout, "chrome");
@@ -1108,25 +1229,34 @@ impl Renderer {
             pass.set_pipeline(&self.quad_pipe);
             pass.set_bind_group(1, &self.chrome.bind, &[]);
             pass.draw(0..6, 0..nq);
-            // rain, clipped to the centre panel so the text panels stay legible
+            // rain, clipped to the lattice panel so the text panels stay legible
             if nr > 0 {
                 pass.set_pipeline(&self.glyph_pipe);
                 let sc = self.scale;
-                let rx = ((v.center.x + 1.0) * sc).max(1.0) as u32;
-                let ry = ((v.center.y + 1.0) * sc).max(1.0) as u32;
-                let rw = (((v.center.w - 2.0) * sc) as u32).min(self.config.width.saturating_sub(rx)).max(1);
-                let rh = (((v.center.h - 2.0) * sc) as u32).min(self.config.height.saturating_sub(ry)).max(1);
+                let clip = if v.lattice_panel.empty() { v.full } else { v.lattice_panel };
+                let rx = ((clip.x + 1.0) * sc).max(1.0) as u32;
+                let ry = ((clip.y + 1.0) * sc).max(1.0) as u32;
+                let rw = (((clip.w - 2.0) * sc) as u32).min(self.config.width.saturating_sub(rx)).max(1);
+                let rh = (((clip.h - 2.0) * sc) as u32).min(self.config.height.saturating_sub(ry)).max(1);
                 pass.set_scissor_rect(rx, ry, rw, rh);
                 pass.set_bind_group(1, &self.rain.bind, &[]);
                 pass.set_bind_group(2, &self.text[&SZ_SMALL].bind, &[]);
                 pass.draw(0..6, 0..nr);
                 pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
             }
-            // cells + lattice
-            pass.set_bind_group(1, &self.cells.bind, &[]);
-            pass.draw(0..6, 0..(N_LAYERS * N_EXPERTS) as u32);
-            pass.set_bind_group(1, &self.lattice.bind, &[]);
-            pass.draw(0..6, 0..((N_EXPERTS as u32 + 1) + (N_LAYERS as u32 + 1)));
+            // cells + lattice + layer-row heat
+            if self.n_cells > 0 {
+                pass.set_bind_group(1, &self.cells.bind, &[]);
+                pass.draw(0..6, 0..self.n_cells as u32);
+            }
+            if self.n_lattice > 0 {
+                pass.set_bind_group(1, &self.lattice.bind, &[]);
+                pass.draw(0..6, 0..self.n_lattice as u32);
+            }
+            if nh > 0 {
+                pass.set_bind_group(1, &self.rowheat.bind, &[]);
+                pass.draw(0..6, 0..nh);
+            }
             // wash clipped to the lattice footprint
             if nw > 0 {
                 pass.set_pipeline(&self.glyph_pipe);
@@ -1155,7 +1285,7 @@ impl Renderer {
             }
             // text, one draw per glyph size (each size has its own atlas)
             pass.set_pipeline(&self.glyph_pipe);
-            for px in [SZ_SMALL, SZ_BODY, SZ_TITLE] {
+            for px in SIZES {
                 let n = *nt.get(&px).unwrap_or(&0);
                 if n == 0 {
                     continue;
@@ -1171,156 +1301,558 @@ impl Renderer {
         FrameStats { quads: q.len(), glyphs: glyph_count, lamps: lamp_q.len(), streams }
     }
 
-    fn left_panel(&self, st: &State, q: &mut Vec<Quad>, tb: &mut TextBuf) {
-        let p = self.layout.left;
-        let x = p.x + 12.0;
-        let max_x = p.right() - 10.0;
-        let mut y = p.y + 10.0;
-        self.push_text(tb, SZ_TITLE, x, y, "SESSION", GREEN, max_x);
-        y += 28.0;
+    // ------------------------------------------------------------ header
+    fn header(&self, st: &State, q: &mut Vec<Quad>, tb: &mut TextBuf) {
+        let h = self.layout.header;
+        let hx = h.x + 14.0;
+        let max_x = h.right() - 10.0;
+        let tx = self.push_text(tb, SZ_TITLE, hx, h.y + 4.0, "THE MATRIX", BRIGHT, max_x);
+        self.push_text(tb, SZ_SMALL, tx + 16.0, h.y + 10.0,
+            "stage 5 · local intelligence observatory · collector v1 socket", DIM, max_x);
 
-        let cur = st.current_session.clone();
-        let s = cur.as_ref().and_then(|id| st.session(id));
-        match (cur.as_ref(), s) {
-            (Some(id), Some(s)) => {
-                self.row(tb, x, max_x, "id", id, DIM, &mut y);
-                self.row(tb, x, max_x, "tier", &s.tier, DIM, &mut y);
-                let state = if s.finished { format!("finished ({})", s.end_reason) } else { "live".to_string() };
-                self.row(tb, x, max_x, "state", &state, DIM, &mut y);
-                self.row(tb, x, max_x, "requests",
-                    &format!("{} → {} (Δ{})", s.requests_before, s.requests_after, s.request_delta), DIM, &mut y);
-                self.row(tb, x, max_x, "passes", &format!("{}", s.seen_passes), DIM, &mut y);
-                self.row(tb, x, max_x, "positions", &format!("{}", s.seen_positions), DIM, &mut y);
-                self.row(tb, x, max_x, "records", &format!("{}", s.seen_records), DIM, &mut y);
-            }
-            _ => {
-                self.row(tb, x, max_x, "id", "unavailable", AMBER, &mut y);
-                let state = if st.connected { "no active session" } else { "not connected" };
-                self.row(tb, x, max_x, "state", state, AMBER, &mut y);
-            }
-        }
-        self.row(tb, x, max_x, "sessions", &format!("{} started / {} finished", st.sessions_started, st.sessions_finished), FAINT, &mut y);
-        self.row(tb, x, max_x, "totals", &format!("{} passes · {} pos · {} rec", st.passes, st.positions, st.records), FAINT, &mut y);
-        y += 14.0;
-
-        self.push_text(tb, SZ_TITLE, x, y, "ENGINE", GREEN, max_x);
-        y += 28.0;
-        match &st.perf {
-            Some(p) => {
-                let state = if p.state.is_empty() { "unavailable".to_string() } else { p.state.clone() };
-                self.row(tb, x, max_x, "state", &state, DIM, &mut y);
-                self.row(tb, x, max_x, "tok/s", &p.tok_s.map(|v| format!("{v:.1}")).unwrap_or("unavailable".into()), DIM, &mut y);
-                self.row(tb, x, max_x, "requests", &p.requests.map(|v| format!("{v}")).unwrap_or("unavailable".into()), DIM, &mut y);
-                self.row(tb, x, max_x, "output tok", &format!("{}", p.output_tokens), DIM, &mut y);
-                self.row(tb, x, max_x, "drafts", &format!("{} / {}", p.drafts_offered, p.drafts_accepted), DIM, &mut y);
-            }
-            None => {
-                self.row(tb, x, max_x, "state", "unavailable", AMBER, &mut y);
-                self.row(tb, x, max_x, "tok/s", "unavailable", AMBER, &mut y);
-            }
-        }
-        y += 14.0;
-
-        self.push_text(tb, SZ_TITLE, x, y, "HARDWARE", GREEN, max_x);
-        y += 28.0;
-        match &st.hw {
-            Some(h) => {
-                let g = if h.gpu_name.is_empty() { "unavailable".to_string() } else { h.gpu_name.clone() };
-                self.row(tb, x, max_x, "gpu", &g, DIM, &mut y);
-                self.row(tb, x, max_x, "gpu util", &h.util_pct.map(|v| format!("{v:.0}%")).unwrap_or("unavailable".into()), DIM, &mut y);
-                self.row(tb, x, max_x, "gpu mem", &h.mem_used_mib.map(|v| format!("{v:.0} MiB")).unwrap_or("unavailable".into()), DIM, &mut y);
-                self.row(tb, x, max_x, "gpu temp", &h.temp_c.map(|v| format!("{v:.0} C")).unwrap_or("unavailable".into()), DIM, &mut y);
-                self.row(tb, x, max_x, "load1", &h.load1.map(|v| format!("{v:.2}")).unwrap_or("unavailable".into()), DIM, &mut y);
-            }
-            None => {
-                self.row(tb, x, max_x, "gpu", "unavailable", AMBER, &mut y);
-            }
-        }
-        y += 14.0;
-
-        self.push_text(tb, SZ_TITLE, x, y, "STREAM HEALTH", GREEN, max_x);
-        y += 28.0;
-        self.row(tb, x, max_x, "last seq", &format!("{}", st.last_seq), DIM, &mut y);
-        self.row(tb, x, max_x, "seq gaps",
-            &format!("{} ({} missing)", st.seq_gaps, st.seq_missing),
-            if st.seq_missing > 0 { AMBER } else { DIM }, &mut y);
-        let drops = match &st.status {
-            Some(s) => format!("{} ours / {} coll", s.sub_dropped, s.drops_total),
-            None => "unavailable".to_string(),
+        // model chip, right aligned
+        let (model_txt, model_col) = match (&st.model, st.meta_source.as_deref()) {
+            (Some(m), Some("collector-store")) => (format!("MODEL {m} · collector store"), DIM),
+            (Some(m), _) => (format!("MODEL {m}"), DIM),
+            (None, _) => ("MODEL unavailable — no meta event".to_string(), AMBER),
         };
-        self.row(tb, x, max_x, "drops", &drops, DIM, &mut y);
-        self.row(tb, x, max_x, "gaps", &format!("{}", st.gaps_seen), DIM, &mut y);
-        let replay = match &st.status {
-            Some(s) => format!("{} / {} trunc", s.sub_replayed, s.sub_replay_truncated),
-            None => "unavailable".to_string(),
-        };
-        self.row(tb, x, max_x, "replay", &replay, DIM, &mut y);
+        let mw = text::text_width(self.face(SZ_SMALL), &model_txt) + 16.0;
+        let mx = (h.right() - 12.0 - mw).max(hx + 320.0);
+        chip(q, Rect { x: mx, y: h.y + 6.0, w: mw, h: 22.0 }, model_col);
+        self.push_text(tb, SZ_SMALL, mx + 9.0, h.y + 9.0, &model_txt, model_col, h.right() - 12.0);
 
-        // explicit placeholders
-        let py = p.bottom() - 66.0;
-        self.push_text(tb, SZ_SMALL, x, py, "not implemented this stage:", FAINT, max_x);
-        self.push_text(tb, SZ_SMALL, x, py + 16.0, "· SQLITE HISTORY / SESSION LIST", FAINT, max_x);
-        self.push_text(tb, SZ_SMALL, x, py + 32.0, "· PER-EXPERT DRILL-DOWN", FAINT, max_x);
-        self.push_text(tb, SZ_SMALL, x, py + 48.0, "· EXPERT RESIDENCY (not in v1 stream)", FAINT, max_x);
-        let _ = q;
+        // second row: connection, telemetry, placement, view tabs
+        let row2 = h.y + h.h - 26.0;
+        let mut cx = hx;
+        let (conn_txt, conn_col) = if st.connected {
+            (format!("COLLECTOR CONNECTED  {} peers", st.status.as_ref().map(|s| s.subscribers).unwrap_or(0)), GREEN)
+        } else {
+            ("COLLECTOR NOT CONNECTED — retrying".to_string(), RED)
+        };
+        cx = chip_text(self, q, tb, cx, row2, &conn_txt, conn_col);
+        cx = chip_text(self, q, tb, cx, row2,
+            &format!("SEQ {} · GAPS {} · SKIPPED {} B", st.last_seq, st.gaps_seen, st.skipped_bytes_seen),
+            if st.gaps_seen > 0 { AMBER } else { DIM });
+        let (pl_txt, pl_col) = if st.placement.monitor.is_empty() {
+            ("MONITOR unknown".to_string(), AMBER)
+        } else if st.placement.verified {
+            (format!("{} {}x{} {}", st.placement.monitor, st.placement.w, st.placement.h,
+                     if st.placement.fullscreen == 2 { "FULLSCREEN" } else { "WINDOWED" }), DIM)
+        } else {
+            (format!("{} (unverified placement)", st.placement.monitor), AMBER)
+        };
+        cx = chip_text(self, q, tb, cx, row2, &pl_txt, pl_col);
+        self.push_text(tb, SZ_MICRO, cx + 6.0, row2 + 2.0,
+            "1 overview · 2 activation · 3 sessions · 4 perf · 5 stream · j/k row · r rain · f fullscreen",
+            FAINT, max_x);
+
+        // view tabs, right aligned
+        let mut tab_x = h.right() - 12.0;
+        for (i, name) in VIEW_NAMES.iter().enumerate().rev() {
+            let on = st.view as usize == i;
+            let w = text::text_width(self.face(SZ_MICRO), name) + 14.0;
+            tab_x -= w;
+            if on {
+                chip(q, Rect { x: tab_x, y: row2 - 4.0, w, h: 20.0 }, GREEN);
+            }
+            self.push_text(tb, SZ_MICRO, tab_x + 7.0, row2 + 1.0, name,
+                if on { BRIGHT } else { FAINT }, max_x);
+            tab_x -= 4.0;
+        }
     }
 
-    fn right_panel(&self, st: &State, overlay: &Overlay, q: &mut Vec<Quad>, tb: &mut TextBuf) {
-        let p = self.layout.right;
-        let x = p.x + 12.0;
-        let max_x = p.right() - 10.0;
-        let mut y = p.y + 10.0;
-        self.push_text(tb, SZ_TITLE, x, y, "ACTIVATION", GREEN, max_x);
-        y += 24.0;
-        self.push_text(tb, SZ_SMALL, x, y,
-            &format!("live lamps {} · records {} (cumulative)", overlay.live(), st.records), FAINT, max_x);
-        y += 18.0;
-        self.push_text(tb, SZ_SMALL, x, y, "records per layer", FAINT, max_x);
-        y += 16.0;
+    // ------------------------------------------------------------ lattice
+    fn lattice(&self, st: &State, overlay: &Overlay, tb: &mut TextBuf, row_q: &mut Vec<Quad>) {
+        let v = self.layout;
+        let p = v.lattice_panel;
+        let (nl, ne) = self.dim;
+        let max_x = p.right() - 8.0;
+        self.push_text(tb, SZ_BODY, p.x + 12.0, p.y + 6.0,
+            &format!("ROUTING LATTICE · {} layers × {} experts · top-k {} · cell {:.2} px",
+                     nl, ne, if st.k > 0 { st.k } else { 10 }, v.cell),
+            DIM, max_x);
 
+        // per-layer activity heat: a real decaying measure of recent selections
+        let hottest = overlay.heat.iter().copied().fold(0.0f32, f32::max).max(1.0);
+        for layer in 0..nl {
+            let h = overlay.heat.get(layer).copied().unwrap_or(0.0);
+            if h <= 0.02 {
+                continue;
+            }
+            let y = v.grid.y + (nl - 1 - layer) as f32 * v.cell_h;
+            let r = (h / hottest).powf(0.6);
+            // a faint full-row tint plus a 3 px marker in the gutter: enough to
+            // read "this layer is routing right now" without painting the row
+            // bright enough to be mistaken for activations
+            row_q.push(Quad {
+                rect: [v.grid.x, y, v.grid.w, v.cell_h.max(1.0)],
+                color: [0.42, 1.0, 0.58, 0.03 + r * 0.07],
+            });
+            row_q.push(Quad {
+                rect: [v.grid.x - 6.0, y, 3.0, v.cell_h.max(1.0)],
+                color: [0.55, 1.0, 0.70, 0.25 + r * 0.65],
+            });
+        }
+        // selected row outline (interaction: j/k walks the layers)
+        if st.sel_layer < nl {
+            let y = v.grid.y + (nl - 1 - st.sel_layer) as f32 * v.cell_h;
+            for (yy, hh) in [(y - 1.0, 1.0f32), (y + v.cell_h, 1.0)] {
+                row_q.push(Quad { rect: [v.grid.x - 2.0, yy, v.grid.w + 4.0, hh], color: [0.85, 1.0, 0.88, 0.85] });
+            }
+            row_q.push(Quad { rect: [v.grid.x - 2.0, y, 1.0, v.cell_h.max(1.0)], color: [0.85, 1.0, 0.88, 0.85] });
+            row_q.push(Quad { rect: [v.grid.x + v.grid.w + 1.0, y, 1.0, v.cell_h.max(1.0)], color: [0.85, 1.0, 0.88, 0.85] });
+        }
+
+        // layer gutter labels
+        let step = if nl > 32 { 8 } else { 4 };
+        for layer in (0..nl).step_by(step.max(1)) {
+            let y = v.grid.y + (nl - 1 - layer) as f32 * v.cell_h + v.cell_h * 0.5 - 6.0;
+            let s = format!("L{layer:02}");
+            let wpx = text::text_width(self.face(SZ_MICRO), &s);
+            let col = if layer == st.sel_layer { BRIGHT } else { FAINT };
+            self.push_text(tb, SZ_MICRO, v.grid.x - 6.0 - wpx, y, &s, col, max_x);
+        }
+        for e in (0..ne).step_by(64) {
+            let x = v.grid.x + e as f32 * v.cell;
+            self.push_text(tb, SZ_MICRO, x, v.grid.bottom() + 4.0, &format!("{e}"), FAINT, max_x);
+        }
+
+        // selected layer readout (per-layer selection count, exact)
+        let sel = st.sel_layer.min(nl.saturating_sub(1));
+        let cnt = st.layer_counts.get(sel).copied().unwrap_or(0);
+        let total = st.layer_counts.iter().sum::<u64>().max(1);
+        let share = cnt as f64 / total as f64 * 100.0;
+        let row_y = p.bottom() - 34.0;
+        let s = format!("ROW L{sel:02} · {cnt} selections ({share:.1}% of {} records) · heat {:.2}",
+            st.records, overlay.heat.get(sel).copied().unwrap_or(0.0));
+        self.push_text(tb, SZ_SMALL, p.x + 12.0, row_y, &s, if cnt > 0 { DIM } else { FAINT }, max_x);
+        let cline = match (&st.current_session, st.connected) {
+            (Some(id), _) => format!("live session {} · passes {} · positions {} · records {}",
+                id, st.passes, st.positions, st.records),
+            (None, true) => "no active session — lattice idle, rain continues · no activity is invented".to_string(),
+            (None, false) => "collector not connected — no data to draw".to_string(),
+        };
+        self.push_text(tb, SZ_SMALL, p.x + 12.0, p.bottom() - 16.0, &cline, DIM, max_x);
+    }
+
+    // ------------------------------------------------------------ sessions
+    fn panel_sessions(&self, r: Rect, st: &State, _q: &mut Vec<Quad>, tb: &mut TextBuf) {
+        let x = r.x + 12.0;
+        let max_x = r.right() - 10.0;
+        let mut y = r.y + 8.0;
+        let wide = r.w >= 560.0;
+        self.push_text(tb, SZ_BODY, x, y, "SESSIONS", GREEN, max_x);
+        self.push_text(tb, SZ_MICRO, x, y + 19.0,
+            "collector windows · tier is the collector's attribution at close", FAINT, max_x);
+        y += 38.0;
+
+        let sum_delta: i64 = st.sessions.iter().map(|s| s.request_delta.max(0)).sum();
+        let unattributed = st.sessions.iter().filter(|s| s.tier == "unattributed").count();
+        let live = st.sessions.iter().filter(|s| !s.finished).count();
+        self.row(tb, x, max_x, "windows", &format!("{} in list · {} live · {} closed", st.sessions.len(), live, st.sessions.len() - live), DIM, &mut y, 18.0);
+        self.row(tb, x, max_x, "started/finished", &format!("{} / {}", st.sessions_started, st.sessions_finished), DIM, &mut y, 18.0);
+        self.row(tb, x, max_x, "sum Δreq", &format!("{} across {} windowed", sum_delta, st.sessions.iter().filter(|s| s.tier == "windowed").count()), DIM, &mut y, 18.0);
+        let eng = st.status.as_ref().map(|s| s.engine_requests_total).unwrap_or(-1);
+        self.row(tb, x, max_x, "engine requests", &if eng >= 0 { format!("{eng} total · {} unattributed",
+            st.status.as_ref().map(|s| s.unattributed_requests).unwrap_or(0)) } else { "unavailable".into() },
+            if eng >= 0 { DIM } else { AMBER }, &mut y, 18.0);
+        self.row(tb, x, max_x, "unattributed wins", &format!("{unattributed}"), if unattributed > 0 { AMBER } else { DIM }, &mut y, 18.0);
+        y += 6.0;
+
+        if wide {
+            self.push_text(tb, SZ_MICRO, x, y, "ID", FAINT, max_x);
+            self.push_text(tb, SZ_MICRO, x + 190.0, y, "TIER", FAINT, max_x);
+            self.push_text(tb, SZ_MICRO, x + 280.0, y, "STATE", FAINT, max_x);
+            self.right_text(tb, SZ_MICRO, x + 430.0, y, "ΔREQ", FAINT, max_x);
+            self.right_text(tb, SZ_MICRO, x + 500.0, y, "PASSES", FAINT, max_x);
+            self.right_text(tb, SZ_MICRO, x + 570.0, y, "POS", FAINT, max_x);
+            self.right_text(tb, SZ_MICRO, x + 660.0, y, "RECORDS", FAINT, max_x);
+            self.right_text(tb, SZ_MICRO, x + 760.0, y, "B→A", FAINT, max_x);
+            self.right_text(tb, SZ_MICRO, x + 850.0, y, "DURATION", FAINT, max_x);
+            self.right_text(tb, SZ_MICRO, x + 960.0, y, "TRACE BYTES", FAINT, max_x);
+            y += 15.0;
+        }
+
+        let step = if wide { 18.0 } else { 30.0 };
+        let bottom = r.bottom() - 30.0;
+        let mut shown = 0usize;
+        for s in st.sessions.iter().rev() {
+            if y + step > bottom {
+                break;
+            }
+            shown += 1;
+            let tier_col = match s.tier.as_str() {
+                "windowed" => GREEN,
+                "unattributed" => AMBER,
+                _ => FAINT,
+            };
+            let state = if s.finished { format!("{}", if s.end_reason.is_empty() { "closed".into() } else { s.end_reason.clone() }) } else { "live".to_string() };
+            if wide {
+                let id = text::fit(self.face(SZ_SMALL), &s.id, 180.0);
+                self.push_text(tb, SZ_SMALL, x, y, &id, if s.finished { DIM } else { BRIGHT }, max_x);
+                self.push_text(tb, SZ_SMALL, x + 190.0, y, &s.tier, tier_col, max_x);
+                self.push_text(tb, SZ_SMALL, x + 280.0, y, &state, DIM, max_x);
+                let d = if s.request_delta >= 0 { s.request_delta.to_string() } else { "—".into() };
+                self.right_text(tb, SZ_SMALL, x + 430.0, y, &d, if s.request_delta > 0 { BRIGHT } else { DIM }, max_x);
+                self.right_text(tb, SZ_SMALL, x + 500.0, y, &fmt_i(s.passes, s.seen_passes), DIM, max_x);
+                self.right_text(tb, SZ_SMALL, x + 570.0, y, &fmt_i(s.positions, s.seen_positions), DIM, max_x);
+                self.right_text(tb, SZ_SMALL, x + 660.0, y, &fmt_i(s.records, s.seen_records), DIM, max_x);
+                let ba = if s.requests_before >= 0 { format!("{}→{}", s.requests_before, s.requests_after) } else { "—".into() };
+                self.right_text(tb, SZ_SMALL, x + 760.0, y, &ba, FAINT, max_x);
+                let dur = if s.duration_s >= 0.0 { format!("{:.1}s", s.duration_s) } else { "—".into() };
+                self.right_text(tb, SZ_SMALL, x + 850.0, y, &dur, FAINT, max_x);
+                let tb2 = if s.trace_bytes >= 0 { format!("{}", s.trace_bytes) } else { "—".into() };
+                self.right_text(tb, SZ_SMALL, x + 960.0, y, &tb2, FAINT, max_x);
+            } else {
+                let id = text::fit(self.face(SZ_SMALL), &s.id, max_x - x - 70.0);
+                self.push_text(tb, SZ_SMALL, x, y, &id, if s.finished { DIM } else { BRIGHT }, max_x);
+                self.right_text(tb, SZ_MICRO, max_x, y + 2.0, &s.tier, tier_col, max_x);
+                let l2 = format!("Δ{} · {}p · {}r · {}", if s.request_delta >= 0 { s.request_delta.to_string() } else { "—".into() },
+                    s.seen_passes, s.seen_records, state);
+                self.push_text(tb, SZ_MICRO, x + 8.0, y + 14.0, &l2, FAINT, max_x);
+            }
+            y += step;
+        }
+        if shown == 0 {
+            self.push_text(tb, SZ_SMALL, x, y, if st.connected { "no sessions yet — none invented" } else { "collector not connected" },
+                AMBER, max_x);
+        }
+        self.push_text(tb, SZ_MICRO, x, r.bottom() - 16.0,
+            "windowed = engine request seen · unattributed = closed with no request · * = seen by this app while open",
+            FAINT, max_x);
+    }
+
+    // ------------------------------------------------------------ activation
+    fn panel_activation(&self, r: Rect, st: &State, overlay: &Overlay, q: &mut Vec<Quad>, tb: &mut TextBuf) {
+        let x = r.x + 12.0;
+        let max_x = r.right() - 10.0;
+        let mut y = r.y + 8.0;
+        let wide = r.w >= 560.0;
+        self.push_text(tb, SZ_BODY, x, y, "ACTIVATION", GREEN, max_x);
+        self.push_text(tb, SZ_MICRO, x, y + 19.0,
+            "expert_selected events · lamps are real selections, faded over 8 s", FAINT, max_x);
+        y += 38.0;
+
+        self.row(tb, x, max_x, "records", &format!("{}", st.records), DIM, &mut y, 18.0);
+        self.row(tb, x, max_x, "passes/positions", &format!("{} / {}", st.passes, st.positions), DIM, &mut y, 18.0);
+        self.row(tb, x, max_x, "live lamps", &format!("{} (history {})", overlay.live().min(overlay.cur.len()), overlay.hist.len()), DIM, &mut y, 18.0);
+        self.row(tb, x, max_x, "activated", &format!("{}", overlay.activated), DIM, &mut y, 18.0);
         let top = st.layer_counts.iter().copied().max().unwrap_or(0).max(1);
+        let active_layers = st.layer_counts.iter().filter(|c| **c > 0).count();
+        self.row(tb, x, max_x, "layers active", &format!("{} of {}", active_layers, self.dim.0), DIM, &mut y, 18.0);
+        y += 4.0;
+
+        // per-layer selection counts: the lattice's own numbers, plus a bar
         let bar_x = x + 34.0;
-        let bar_w = (p.w - 96.0).max(40.0);
-        let limit = p.bottom() - 120.0;
-        for layer in 0..N_LAYERS {
-            if y + 13.0 > limit {
+        let count_w = 46.0;
+        let bar_w = (max_x - bar_x - count_w).max(30.0);
+        let rows_h = (r.h * if wide { 0.46 } else { 0.42 }).max(120.0);
+        let limit = (y + rows_h).min(r.bottom() - 150.0);
+        self.push_text(tb, SZ_MICRO, x, y, "selections per layer", FAINT, max_x);
+        y += 14.0;
+        let step = ((limit - y) / self.dim.0.max(1) as f32).clamp(10.0, 14.0);
+        for layer in 0..self.dim.0 {
+            if y + step > limit {
                 break;
             }
             let c = st.layer_counts[layer];
-            self.push_text(tb, SZ_SMALL, x, y, &format!("L{layer:02}"), FAINT, max_x);
+            let sel = layer == st.sel_layer;
+            self.push_text(tb, SZ_MICRO, x, y, &format!("L{layer:02}"), if sel { BRIGHT } else { FAINT }, max_x);
             if c > 0 {
                 let w = (bar_w * (c as f32 / top as f32)).max(2.0);
-                q.push(Quad { rect: [bar_x, y + 3.0, w, 7.0], color: [0.18, 0.62, 0.32, 0.85] });
+                q.push(Quad {
+                    rect: [bar_x, y + 2.0, w, step - 4.0],
+                    color: if sel { [0.55, 1.0, 0.70, 0.95] } else { [0.18, 0.62, 0.32, 0.85] },
+                });
             }
-            let label = if c > 0 { format!("{c}") } else { "·".to_string() };
-            let lw = text::text_width(self.face(SZ_SMALL), &label);
-            self.push_text(tb, SZ_SMALL, bar_x + bar_w + 6.0 - lw, y, &label, DIM, max_x);
-            y += 13.0;
+            let label = if c > 0 { c.to_string() } else { "·".to_string() };
+            self.right_text(tb, SZ_MICRO, max_x, y, &label, if c > 0 { DIM } else { FAINT }, max_x);
+            y += step;
+        }
+        y += 6.0;
+
+        // selected row readout
+        let sel = st.sel_layer.min(self.dim.0.saturating_sub(1));
+        let cnt = st.layer_counts.get(sel).copied().unwrap_or(0);
+        self.push_text(tb, SZ_SMALL, x, y, &format!("ROW L{sel:02} · {cnt} selections · heat {:.2}",
+            overlay.heat.get(sel).copied().unwrap_or(0.0)), BRIGHT, max_x);
+        y += 20.0;
+
+        // hot experts — exact counts from this app's stream
+        self.push_text(tb, SZ_MICRO, x, y, "hottest experts (cumulative)", FAINT, max_x);
+        y += 14.0;
+        let hot = st.hot_experts(10);
+        let hot_max = hot.first().map(|(_, c)| *c).unwrap_or(1).max(1);
+        let hot_rows = if wide { 10 } else { 6 };
+        for (i, (e, c)) in hot.iter().take(hot_rows).enumerate() {
+            if y + 12.0 > r.bottom() - 96.0 {
+                break;
+            }
+            self.push_text(tb, SZ_MICRO, x, y, &format!("E{e:03}"), DIM, max_x);
+            let w = (bar_w * (*c as f32 / hot_max as f32)).max(1.0);
+            q.push(Quad { rect: [bar_x, y + 2.0, w, 6.0], color: [0.30, 0.85, 0.50, 0.75] });
+            self.right_text(tb, SZ_MICRO, max_x, y, &c.to_string(), FAINT, max_x);
+            y += 12.0;
+            let _ = i;
         }
 
-        let py = p.bottom() - 106.0;
-        self.push_text(tb, SZ_SMALL, x, py, "not implemented this stage:", FAINT, max_x);
-        self.push_text(tb, SZ_SMALL, x, py + 16.0, "· EXPERT TOPOLOGY / CO-ACTIVATION", FAINT, max_x);
-        self.push_text(tb, SZ_SMALL, x, py + 32.0, "· ROUTED TOKEN TEXT — unavailable", FAINT, max_x);
-        self.push_text(tb, SZ_SMALL, x, py + 47.0, "  the v1 stream carries no token text,", FAINT, max_x);
-        self.push_text(tb, SZ_SMALL, x, py + 61.0, "  so it is shown as unavailable, never invented", FAINT, max_x);
-        self.push_text(tb, SZ_SMALL, x, py + 77.0, "· SCORES / WEIGHTS — unavailable", FAINT, max_x);
+        // honest unavailable block
+        let uy = r.bottom() - 84.0;
+        self.push_text(tb, SZ_MICRO, x, uy, "unavailable in the v1 stream (never invented):", FAINT, max_x);
+        self.push_text(tb, SZ_MICRO, x, uy + 14.0, "· EXPERT RESIDENCY (VRAM/RAM/SSD) — no residency events", FAINT, max_x);
+        self.push_text(tb, SZ_MICRO, x, uy + 27.0, "· ROUTING SCORES — serve-path weights are all 0.0", FAINT, max_x);
+        self.push_text(tb, SZ_MICRO, x, uy + 40.0, "· TOKEN TEXT — pass_index only, no decoded tokens", FAINT, max_x);
+        self.push_text(tb, SZ_MICRO, x, uy + 53.0, "· CO-ACTIVATION / HISTORY REPLAY — later stage", FAINT, max_x);
     }
 
-    pub fn footer_string(&self, st: &State) -> String {
-        self.footer_text(st, crate::now_unix())
+    // ------------------------------------------------------------ perf
+    fn panel_perf(&self, r: Rect, st: &State, q: &mut Vec<Quad>, tb: &mut TextBuf) {
+        let x = r.x + 12.0;
+        let max_x = r.right() - 10.0;
+        let mut y = r.y + 8.0;
+        let wide = r.w >= 560.0;
+        self.push_text(tb, SZ_BODY, x, y, "ENGINE PERF", GREEN, max_x);
+        self.push_text(tb, SZ_MICRO, x, y + 19.0, "perf_sample · collector's /metrics poll", FAINT, max_x);
+        y += 36.0;
+
+        match &st.perf {
+            Some(p) => {
+                let state_col = if p.engine_ok { GREEN } else { RED };
+                self.row(tb, x, max_x, "state", &if p.state.is_empty() { "unavailable".into() } else { p.state.clone() }, state_col, &mut y, 18.0);
+                self.row(tb, x, max_x, "tok/s", &fmtf(p.tok_s, 1, ""), DIM, &mut y, 18.0);
+                self.row(tb, x, max_x, "requests", &p.requests.map(|v| v.to_string()).unwrap_or("unavailable".into()), DIM, &mut y, 18.0);
+                let (a, b) = (x + r.w * 0.5, x + r.w * 0.5);
+                let mut y2 = y;
+                self.row(tb, x, max_x, "prompt tok", &format!("{}", p.prompt_tokens), DIM, &mut y, 18.0);
+                self.row(tb, x, max_x, "output tok", &format!("{}", p.output_tokens), DIM, &mut y, 18.0);
+                self.row(tb, x, max_x, "drafts", &format!("{} / {} acc", p.drafts_offered, p.drafts_accepted), DIM, &mut y, 18.0);
+                if wide {
+                    // second column of the same real sample
+                    let x2 = a;
+                    self.row(tb, x2, max_x, "Δreq/Δout", &format!("{} / {}", p.delta_requests, p.delta_output), FAINT, &mut y2, 18.0);
+                    self.row(tb, x2, max_x, "samples", &format!("{}", st.perf_samples), FAINT, &mut y2, 18.0);
+                    self.row(tb, x2, max_x, "baseline", &format!("{}", p.baseline), FAINT, &mut y2, 18.0);
+                    self.row(tb, x2, max_x, "engine", &st.engine_name.clone().unwrap_or("unavailable".into()), FAINT, &mut y2, 18.0);
+                    let _ = b;
+                    y = y.max(y2);
+                }
+                // tok/s sparkline of the samples actually received: a bounded
+                // box (never the whole panel) so a handful of samples cannot
+                // turn into giant bars
+                let chart_h = (r.bottom() - y - 60.0).clamp(0.0, 140.0);
+                if chart_h > 36.0 {
+                    let cw = if wide { ((max_x - x) * 0.5).clamp(160.0, 620.0) } else { max_x - x };
+                    self.push_text(tb, SZ_MICRO, x, y, &format!("tok/s history · {} samples", st.perf_hist.len()), FAINT, max_x);
+                    let chart = Rect { x, y: y + 14.0, w: cw, h: chart_h };
+                    q.push(Quad { rect: [chart.x, chart.y, chart.w, chart.h], color: [0.02, 0.06, 0.035, 0.9] });
+                    let vmax = st.perf_hist.iter().filter_map(|(_, v)| *v).fold(0.0f64, f64::max).max(1.0);
+                    let bw = (chart.w / 120.0).max(1.0).min(10.0);
+                    for (i, (_ts, val)) in st.perf_hist.iter().rev().take(120).enumerate() {
+                        if let Some(v) = val {
+                            let hh = ((*v / vmax) as f32 * (chart.h - 4.0)).max(1.0);
+                            let bx = chart.x + chart.w - (i as f32 + 1.0) * bw;
+                            q.push(Quad {
+                                rect: [bx, chart.y + chart.h - hh, (bw - 1.0).max(1.0), hh],
+                                color: [0.30, 0.85, 0.50, 0.8],
+                            });
+                        }
+                    }
+                    self.push_text(tb, SZ_MICRO, chart.x, chart.bottom() + 2.0,
+                        &format!("peak {vmax:.1} tok/s"), FAINT, max_x);
+                    // the same samples as numbers, newest first
+                    if wide {
+                        let tx = chart.right() + 24.0;
+                        self.push_text(tb, SZ_MICRO, tx, y, "SAMPLE (UTC)      TOK/S", FAINT, max_x);
+                        let mut ry = y + 14.0;
+                        for (tsample, val) in st.perf_hist.iter().rev().take(8) {
+                            if ry + 12.0 > r.bottom() - 46.0 {
+                                break;
+                            }
+                            let line = format!("{}   {}", hms(*tsample),
+                                val.map(|v| format!("{v:.1}")).unwrap_or_else(|| "unavailable".into()));
+                            self.push_text(tb, SZ_MICRO, tx, ry, &line, FAINT, max_x);
+                            ry += 12.0;
+                        }
+                    }
+                }
+            }
+            None => {
+                self.row(tb, x, max_x, "state", "unavailable — no perf_sample", AMBER, &mut y, 18.0);
+                self.row(tb, x, max_x, "tok/s", "unavailable", AMBER, &mut y, 18.0);
+            }
+        }
+        self.push_text(tb, SZ_MICRO, x, r.bottom() - 40.0, "unavailable: TTFT · inter-token latency · prefill rate", FAINT, max_x);
+        self.push_text(tb, SZ_MICRO, x, r.bottom() - 26.0, "perf_sample carries live.tok_s + totals only", FAINT, max_x);
+        self.push_text(tb, SZ_MICRO, x, r.bottom() - 13.0, "— no such fields exist to draw", FAINT, max_x);
+    }
+
+    // ------------------------------------------------------------ stream
+    fn panel_stream(&self, r: Rect, st: &State, _q: &mut Vec<Quad>, tb: &mut TextBuf) {
+        let x = r.x + 12.0;
+        let max_x = r.right() - 10.0;
+        let mut y = r.y + 8.0;
+        let wide = r.w >= 560.0;
+        let tall = r.h > 400.0;
+        let step = if tall { 21.0 } else { 17.0 };
+        self.push_text(tb, SZ_BODY, x, y, "STREAM HEALTH", GREEN, max_x);
+        self.push_text(tb, SZ_MICRO, x, y + 19.0,
+            "telemetry_status + gap events + app-side accounting", FAINT, max_x);
+        y += 38.0;
+        let y_top = y;
+
+        let s = st.status.as_ref();
+        let colw = if wide { r.w * 0.32 } else { r.w };
+        let c1 = x;
+        let c2 = x + colw;
+        let c3 = x + 2.0 * colw;
+
+        let mut yc1 = y;
+        self.row(tb, c1, max_x, "connection",
+            &if st.connected { format!("up · {} reconnects", st.connects) }
+             else { format!("down · {} connection errors", st.connect_errors) },
+            if st.connected { GREEN } else { RED }, &mut yc1, step);
+        self.row(tb, c1, max_x, "last seq", &format!("{} (max {})", st.last_seq, st.seq_max_seen), DIM, &mut yc1, step);
+        self.row(tb, c1, max_x, "seq gaps", &format!("{} · {} missing", st.seq_gaps, st.seq_missing),
+            if st.seq_missing > 0 { AMBER } else { DIM }, &mut yc1, step);
+        self.row(tb, c1, max_x, "events/records", &format!("{} / {}", st.events_total, st.records), DIM, &mut yc1, step);
+        self.row(tb, c1, max_x, "gap events", &format!("{} · {} bytes", st.gaps_seen, st.gap_bytes),
+            if st.gaps_seen > 0 { AMBER } else { DIM }, &mut yc1, step);
+        self.row(tb, c1, max_x, "skipped bytes", &format!("{} (seen of collector total)", st.skipped_bytes_seen),
+            DIM, &mut yc1, step);
+        let reasons: Vec<String> = {
+            let mut v: Vec<(String, u64)> = st.gap_reasons.iter().map(|(k, c)| (k.clone(), *c)).collect();
+            v.sort_by(|a, b| b.1.cmp(&a.1));
+            v.iter().take(3).map(|(k, c)| format!("{k}x{c}")).collect()
+        };
+        self.row(tb, c1, max_x, "gap reasons", &if reasons.is_empty() { "none".into() } else { reasons.join(" ") }, FAINT, &mut yc1, step);
+
+        match s {
+            Some(s) => {
+                let mut yc2 = y_top;
+                self.row(tb, c2, max_x, "rates", &format!("{:.1} ev/s · {:.1} rec/s · {:.0} B/s",
+                    s.events_per_s, s.records_per_s, s.bytes_per_s), DIM, &mut yc2, step);
+                self.row(tb, c2, max_x, "queue ours", &format!("{} deep / {} cap (max {})", s.sub_depth, s.queue_cap, s.sub_max_depth),
+                    if s.queue_cap > 0 && s.sub_depth * 2 > s.queue_cap { AMBER } else { DIM }, &mut yc2, step);
+                self.row(tb, c2, max_x, "drops ours", &format!("{} droppable · {} forced", s.sub_dropped, s.sub_forced),
+                    if s.sub_dropped + s.sub_forced > 0 { AMBER } else { DIM }, &mut yc2, step);
+                self.row(tb, c2, max_x, "drops total", &format!("{} (all subscribers)", s.drops_total),
+                    if s.drops_total > 0 { AMBER } else { DIM }, &mut yc2, step);
+                self.row(tb, c2, max_x, "skipped total", &format!("{} B · {} since last event", s.skipped_bytes_total, s.skipped_since_last), DIM, &mut yc2, step);
+                self.row(tb, c2, max_x, "resyncs/discard", &format!("{} / {}", s.resyncs_total, s.discarded_passes), DIM, &mut yc2, step);
+                self.row(tb, c2, max_x, "replay ours", &format!("{} replayed · {} truncated", s.sub_replayed, s.sub_replay_truncated),
+                    if s.sub_replay_truncated > 0 { AMBER } else { DIM }, &mut yc2, step);
+
+                let mut yc3 = y_top;
+                self.row(tb, c3, max_x, "trace", &format!("off {} / {} · held {}", s.trace_offset, s.file_size, s.held_records), FAINT, &mut yc3, step);
+                self.row(tb, c3, max_x, "collector db", &format!("{} · wal {} B · seq {}", if s.db_ok { "ok" } else { "ERR" }, s.db_wal_bytes, s.db_max_seq),
+                    if s.db_ok { DIM } else { RED }, &mut yc3, step);
+                self.row(tb, c3, max_x, "engine reqs", &format!("{} · {} unattributed", s.engine_requests_total, s.unattributed_requests), DIM, &mut yc3, step);
+                self.row(tb, c3, max_x, "subscribers", &format!("{} · queue cap {}", s.subscribers, s.queue_cap), DIM, &mut yc3, step);
+                if wide && tall {
+                    self.push_text(tb, SZ_MICRO, c3, yc3 + 8.0, "EVENT TYPES (this app)", FAINT, max_x);
+                    let mut ey = yc3 + 24.0;
+                    let mut ev: Vec<(&String, &u64)> = st.by_type.iter().collect();
+                    ev.sort_by(|a, b| b.1.cmp(a.1));
+                    for (k, v) in ev.iter().take(10) {
+                        self.push_text(tb, SZ_MICRO, c3, ey, &format!("{:<24}{}", trunc(k, 24), v), FAINT, max_x);
+                        ey += 13.0;
+                    }
+                }
+                y = yc1.max(yc2).max(yc3) + 10.0;
+
+                // last gap: the honest "something was lost" line
+                if let Some(g) = st.gaps.last() {
+                    let line = format!("last gap {} · {} B · {} · {}", g.reason, g.bytes,
+                        if g.records_unattributed > 0 { format!("{} records unattributed", g.records_unattributed) }
+                        else { "0 unattributed".into() },
+                        trunc(&g.detail, 110));
+                    self.push_text(tb, SZ_MICRO, x, y, &line, AMBER, max_x);
+                    y += 16.0;
+                }
+
+                // subscribers: two columns when there is room
+                if y + 40.0 < r.bottom() - 30.0 {
+                    self.push_text(tb, SZ_MICRO, x, y, "SUBSCRIBER     ID  SENT      DROPPED  FORCED  DEPTH  REPLAYED  TRUNC  BYTES", FAINT, max_x);
+                    y += 14.0;
+                    for sub in s.subs.iter() {
+                        if y + 12.0 > r.bottom() - 40.0 {
+                            break;
+                        }
+                        let line = format!("{:<14} {:<3} {:<9} {:<8} {:<7} {:<6} {:<9} {:<6} {}",
+                            trunc(&sub.name, 14), sub.id, sub.sent, sub.dropped, sub.forced,
+                            sub.depth, sub.replayed, sub.truncated, sub.bytes_out);
+                        let ours = s.sub_id == Some(sub.id);
+                        self.push_text(tb, SZ_MICRO, x, y, &line,
+                            if ours { BRIGHT } else if sub.closed { FAINT } else { DIM }, max_x);
+                        y += 13.0;
+                    }
+                }
+
+                // gap table, right half
+                if wide && r.h > 380.0 && !st.gaps.is_empty() {
+                    let gx = x + r.w * 0.52;
+                    let mut gy = y_top + (r.h * 0.52);
+                    self.push_text(tb, SZ_MICRO, gx, gy, "GAP EVENTS (collector, replayed on connect)", FAINT, max_x);
+                    gy += 14.0;
+                    for g in st.gaps.iter().rev().take(8) {
+                        if gy + 13.0 > r.bottom() - 30.0 {
+                            break;
+                        }
+                        let line = format!("{}  {:<20} {:>9} B  {:>5} unattr", hms(g.ts), trunc(&g.reason, 20), g.bytes, g.records_unattributed);
+                        self.push_text(tb, SZ_MICRO, gx, gy, &line, AMBER, max_x);
+                        gy += 13.0;
+                    }
+                }
+            }
+            None => {
+                self.row(tb, x, max_x, "telemetry", "unavailable — no telemetry_status yet", AMBER, &mut y, step);
+            }
+        }
+        self.push_text(tb, SZ_MICRO, x, r.bottom() - 14.0,
+            "ours = this app's subscriber row · collector-wide counters are labelled (all subscribers)", FAINT, max_x);
+    }
+
+    // ------------------------------------------------------------ hardware
+    fn panel_hardware(&self, r: Rect, st: &State, _q: &mut Vec<Quad>, tb: &mut TextBuf) {
+        let x = r.x + 12.0;
+        let max_x = r.right() - 10.0;
+        let mut y = r.y + 8.0;
+        self.push_text(tb, SZ_BODY, x, y, "HARDWARE", GREEN, max_x);
+        self.push_text(tb, SZ_MICRO, x, y + 19.0, "hw_sample · nvidia-smi + /proc", FAINT, max_x);
+        y += 36.0;
+        match &st.hw {
+            Some(h) => {
+                self.row(tb, x, max_x, "gpu", &if h.gpu_name.is_empty() { "unavailable".into() } else { h.gpu_name.clone() }, DIM, &mut y, 17.0);
+                self.row(tb, x, max_x, "gpu util", &fmtf(h.util_pct, 0, "%"), DIM, &mut y, 17.0);
+                self.row(tb, x, max_x, "gpu mem", &fmtf(h.mem_used_mib, 0, " MiB"), DIM, &mut y, 17.0);
+                self.row(tb, x, max_x, "temp/power", &format!("{} · {}", fmtf(h.temp_c, 0, " C"), fmtf(h.power_w, 0, " W")), DIM, &mut y, 17.0);
+                self.row(tb, x, max_x, "load1", &fmtf(h.load1, 2, ""), DIM, &mut y, 17.0);
+                self.row(tb, x, max_x, "mem avail", &fmtf(h.mem_available_mib, 0, " MiB"), DIM, &mut y, 17.0);
+                self.row(tb, x, max_x, "collector rss", &h.rss_kib.map(|v| format!("{} KiB", v)).unwrap_or("unavailable".into()), FAINT, &mut y, 17.0);
+            }
+            None => {
+                self.row(tb, x, max_x, "gpu", "unavailable — no hw_sample", AMBER, &mut y, 17.0);
+            }
+        }
+        self.push_text(tb, SZ_MICRO, x, r.bottom() - 40.0, "aggregate memory only — per-expert residency", FAINT, max_x);
+        self.push_text(tb, SZ_MICRO, x, r.bottom() - 27.0, "is not in the v1 stream, so it is not drawn", FAINT, max_x);
+        self.push_text(tb, SZ_MICRO, x, r.bottom() - 14.0, "NVMe/SSD metrics: unavailable", FAINT, max_x);
+    }
+
+    fn footer(&self, st: &State, tb: &mut TextBuf) {
+        let f = self.layout.footer;
+        let s = self.footer_text(st, crate::now_unix());
+        self.push_text(tb, SZ_MICRO, f.x + 4.0, f.y + 2.0, &s, FAINT, f.right() - 4.0);
     }
 
     pub fn footer_text(&self, st: &State, now_wall: f64) -> String {
-        let age = if st.last_event_ts > 0.0 {
-            format!("{:.1}s", (now_wall - st.last_event_ts).max(0.0))
-        } else {
-            "n/a".to_string()
-        };
+        let _ = now_wall;
         format!(
-            "seq {} · last event {} ago · rain {} (r) · esc quit · {}x{} · {} · {}",
-            st.last_seq, age, if st.rain { "ON" } else { "OFF" },
-            self.config.width, self.config.height, self.present_mode, self.adapter
+            "seq {} · last event {} UTC · view {} · rain {} (r) · {}x{} · {} · {} · frames {} · redraws {} · unchanged-repaints {}",
+            st.last_seq, hms(st.last_event_ts), VIEW_NAMES[(st.view as usize).min(4)],
+            if st.rain { "ON" } else { "OFF" },
+            self.config.width, self.config.height, self.present_mode, self.adapter,
+            st.frames, st.redraw_requests, st.repaints_unchanged
         )
     }
 }
@@ -1346,16 +1878,41 @@ fn chip(q: &mut Vec<Quad>, r: Rect, col: [f32; 4]) {
 
 fn chip_text(r: &Renderer, q: &mut Vec<Quad>, tb: &mut TextBuf, x: f32, y: f32, s: &str, col: [f32; 4]) -> f32 {
     let w = text::text_width(r.face(SZ_SMALL), s) + 18.0;
-    chip(q, Rect { x, y: y - 5.0, w, h: 23.0 }, col);
+    chip(q, Rect { x, y: y - 5.0, w, h: 22.0 }, col);
     r.push_text(tb, SZ_SMALL, x + 9.0, y - 1.0, s, col, x + w);
     x + w + 8.0
 }
 
-fn short(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
+fn trunc(s: &str, n: usize) -> String {
+    let v: Vec<char> = s.chars().collect();
+    if v.len() <= n {
         s.to_string()
     } else {
-        let keep: String = s.chars().rev().take(n - 2).collect::<Vec<_>>().into_iter().rev().collect();
-        format!("..{keep}")
+        let mut out: String = v[..n.saturating_sub(2)].iter().collect();
+        out.push_str("..");
+        out
     }
+}
+
+fn fmt_i(finished: i64, seen: u64) -> String {
+    if finished >= 0 {
+        finished.to_string()
+    } else {
+        format!("{seen}*")
+    }
+}
+
+fn fmtf(v: Option<f64>, prec: usize, unit: &str) -> String {
+    match v {
+        Some(x) => format!("{x:.prec$}{unit}"),
+        None => "unavailable".into(),
+    }
+}
+
+fn hms(ts: f64) -> String {
+    if ts <= 0.0 {
+        return "n/a".to_string();
+    }
+    let secs = ts as u64 % 86_400;
+    format!("{:02}:{:02}:{:02}.{}", secs / 3600, (secs / 60) % 60, secs % 60, ((ts * 10.0) as u64) % 10)
 }

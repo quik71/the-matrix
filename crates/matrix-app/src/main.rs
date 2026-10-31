@@ -1,4 +1,4 @@
-// THE MATRIX Stage 4 — native application.
+// THE MATRIX Stage 5 — native application.
 //
 //   collector unix socket (v1 NDJSON)  ->  in-app state  ->  winit + wgpu window
 //
@@ -6,6 +6,11 @@
 // socket, keeps its own state from the events it actually received, and draws
 // that state with the same instanced-quad pipeline the measured bench-A harness
 // used. Anything the event stream does not carry is rendered as unavailable.
+//
+// Stage 5 adds the monitoring workstation (SESSIONS / ACTIVATION / ENGINE PERF /
+// STREAM HEALTH / HARDWARE + the interaction lattice), explicit --monitor
+// placement verified against the compositor, and a repaint rule that presents a
+// frame only when a displayed value actually changed.
 
 mod client;
 mod json;
@@ -26,7 +31,7 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 use client::Msg;
-use render::{Overlay, Rain, Renderer};
+use render::{Overlay, Rain, Renderer, VIEW_ACTIVATION, VIEW_OVERVIEW, VIEW_PERF, VIEW_SESSIONS, VIEW_STREAM};
 use state::State;
 
 pub fn now_unix() -> f64 {
@@ -60,6 +65,21 @@ struct Args {
     height: u32,
     wm_fullscreen: bool,
     meta_db: Option<String>,
+    /// Monitor to place the window on. "active" (the default) means whatever
+    /// monitor Hyprland had focused when the app started.
+    monitor: String,
+    view: u8,
+}
+
+fn parse_view(s: &str) -> u8 {
+    match s.to_ascii_lowercase().as_str() {
+        "1" | "overview" => VIEW_OVERVIEW,
+        "2" | "activation" => VIEW_ACTIVATION,
+        "3" | "sessions" => VIEW_SESSIONS,
+        "4" | "perf" => VIEW_PERF,
+        "5" | "stream" => VIEW_STREAM,
+        _ => VIEW_OVERVIEW,
+    }
 }
 
 fn parse_args() -> Args {
@@ -73,6 +93,8 @@ fn parse_args() -> Args {
         height: 900,
         wm_fullscreen: true,
         meta_db: None,
+        monitor: "active".into(),
+        view: VIEW_OVERVIEW,
     };
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -111,24 +133,33 @@ fn parse_args() -> Args {
                 a.meta_db = Some(need(i));
                 i += 2;
             }
+            "--monitor" => {
+                a.monitor = need(i);
+                i += 2;
+            }
+            "--view" => {
+                a.view = parse_view(&need(i));
+                i += 2;
+            }
             "--wm-fullscreen" => {
                 a.wm_fullscreen = need(i) != "off";
                 i += 2;
             }
             "--help" | "-h" => {
                 println!(
-                    "matrix-app — THE MATRIX native viewer\n\
+                    "matrix-app — THE MATRIX native viewer (stage 5)\n\
                      --socket <path>        collector unix socket (default /home/main/the-matrix/run/collector.sock)\n\
                      --font <ttf/ttc>       font for the glyph atlas\n\
-                     --stats <path|->       write the counter dump as JSON every --stats-ms (or print to stdout)\n\
+                     --stats <path|->       write the state/panel dump as JSON every --stats-ms (or print to stdout)\n\
                      --stats-ms <n>         dump interval in ms (1000)\n\
                      --rain <on|off>        Matrix rain animation (on)\n\
                      --width/--height <n>   initial window size (1600x900); the WM makes it fullscreen\n\
-                     --wm-fullscreen <on|off> ask Hyprland for WM-fullscreen on the monitor (on)\n\
-                     --meta-db <sqlite>     read the collector's recorded meta event back when the\n\
-                                           socket stream never carried one (late attach); labelled\n\
-                                           as 'collector store' in the UI and in the dump\n\
-                     keys: esc quit · r toggle rain · f toggle WM-fullscreen"
+                     --monitor <name|active> place the window on this Hyprland monitor (default: the focused one)\n\
+                     --view <1..5|name>     overview | activation | sessions | perf | stream (default overview)\n\
+                     --wm-fullscreen <on|off> ask Hyprland for WM-fullscreen on the target monitor (on)\n\
+                     --meta-db <sqlite>     fallback: read the collector's recorded meta row when the socket\n\
+                                           never delivered one (labelled 'collector store' in the UI)\n\
+                     keys: esc quit · r rain · f fullscreen · 1-5 views · j/k or up/down select layer"
                 );
                 std::process::exit(0);
             }
@@ -160,6 +191,8 @@ struct App {
     frames: u64,
     spawned: bool,
     next_frame: Instant,
+    last_fp: u64,
+    resize_pending: bool,
 }
 
 impl App {
@@ -196,8 +229,9 @@ impl App {
                     st.last_disconnect_reason = reason;
                     let _ = wall;
                 }
-                Ok(Msg::ConnectError { err, .. }) => {
+                Ok(Msg::ConnectError { err, wall }) => {
                     st.connect_errors += 1;
+                    st.connect_error_wall = wall;
                     if st.connected {
                         st.connected = false;
                         st.disconnects += 1;
@@ -212,6 +246,23 @@ impl App {
         }
         drop(st);
         self.overlay.tick(self.elapsed_ms());
+    }
+
+    /// True when a visible value changed (or a lamp is still fading). This is
+    /// the whole present-on-demand rule: no animation, no change, no frame.
+    fn visual_change(&mut self) -> bool {
+        let fp = {
+            let st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+            st.fingerprint()
+        };
+        let anim = self.overlay.animating(self.elapsed_ms());
+        if fp != self.last_fp || anim {
+            true
+        } else {
+            let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+            st.wakes_skipped += 1;
+            false
+        }
     }
 
     fn spawn_client(&mut self, proxy: EventLoopProxy<()>) {
@@ -256,19 +307,31 @@ impl ApplicationHandler<()> for App {
         );
         self.gpu = Some(gpu);
         self.window = Some(window.clone());
-        { let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner()); st.rain = self.args.rain; }
+        {
+            let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+            st.rain = self.args.rain;
+            st.view = self.args.view;
+        }
         self.rain = Rain::new(size.width as f32, size.height as f32);
         self.t0 = Instant::now();
         if self.args.wm_fullscreen {
-            std::thread::spawn(wm_fullscreen);
+            let target = if self.args.monitor == "active" { None } else { Some(self.args.monitor.clone()) };
+            let st2 = self.st.clone();
+            std::thread::spawn(move || placement_task(target, st2));
+        } else {
+            let st2 = self.st.clone();
+            let req = self.args.monitor.clone();
+            std::thread::spawn(move || read_placement(req, st2, false));
         }
         window.request_redraw();
     }
 
     fn user_event(&mut self, _el: &ActiveEventLoop, _ev: ()) {
         self.drain();
-        if let Some(w) = self.window.as_ref() {
-            w.request_redraw();
+        if self.visual_change() {
+            if let Some(w) = self.window.as_ref() {
+                w.request_redraw();
+            }
         }
     }
 
@@ -282,23 +345,78 @@ impl ApplicationHandler<()> for App {
                         g.config.width, g.config.height,
                         g.layout.w, g.layout.h, g.layout.cell);
                 }
+                self.resize_pending = true;
                 if let Some(w) = self.window.as_ref() {
                     w.request_redraw();
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
+                    let mut dirty = false;
                     match event.logical_key {
                         Key::Named(NamedKey::Escape) => el.exit(),
                         Key::Character(ref c) if c.eq_ignore_ascii_case("r") => {
                             let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
                             st.rain = !st.rain;
                             drop(st);
-                            if let Some(w) = self.window.as_ref() {
-                                w.request_redraw();
+                            dirty = true;
+                        }
+                        Key::Character(ref c) if c.eq_ignore_ascii_case("f") => {
+                            std::thread::spawn(wm_fullscreen_toggle);
+                        }
+                        Key::Character(ref c) if c.eq_ignore_ascii_case("j") => {
+                            let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+                            st.sel_pinned = true;
+                            st.sel_layer = (st.sel_layer + 1) % st.layers.max(1);
+                            drop(st);
+                            dirty = true;
+                        }
+                        Key::Character(ref c) if c.eq_ignore_ascii_case("k") => {
+                            let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+                            st.sel_pinned = true;
+                            let n = st.layers.max(1);
+                            st.sel_layer = (st.sel_layer + n - 1) % n;
+                            drop(st);
+                            dirty = true;
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+                            st.sel_pinned = true;
+                            st.sel_layer = (st.sel_layer + 1) % st.layers.max(1);
+                            drop(st);
+                            dirty = true;
+                        }
+                        Key::Named(NamedKey::ArrowUp) => {
+                            let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+                            st.sel_pinned = true;
+                            let n = st.layers.max(1);
+                            st.sel_layer = (st.sel_layer + n - 1) % n;
+                            drop(st);
+                            dirty = true;
+                        }
+                        Key::Character(ref c) => {
+                            let cs = c.to_string();
+                            let v = match cs.as_str() {
+                                "1" => Some(VIEW_OVERVIEW),
+                                "2" => Some(VIEW_ACTIVATION),
+                                "3" => Some(VIEW_SESSIONS),
+                                "4" => Some(VIEW_PERF),
+                                "5" => Some(VIEW_STREAM),
+                                _ => None,
+                            };
+                            if let Some(v) = v {
+                                let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+                                st.view = v;
+                                drop(st);
+                                dirty = true;
                             }
                         }
                         _ => {}
+                    }
+                    if dirty {
+                        if let Some(w) = self.window.as_ref() {
+                            w.request_redraw();
+                        }
                     }
                 }
             }
@@ -307,8 +425,21 @@ impl ApplicationHandler<()> for App {
                 let now = self.elapsed_ms();
                 let dt = (now - self.last_draw_ms) as f32;
                 self.last_draw_ms = now;
+                let fp = {
+                    let st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+                    st.fingerprint()
+                };
+                let animating = self.overlay.animating(now);
+                let rain_on = self.st.lock().unwrap_or_else(|p| p.into_inner()).rain;
+                if fp == self.last_fp && !animating && !rain_on && !self.resize_pending {
+                    let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+                    st.repaints_unchanged += 1;
+                }
+                self.resize_pending = false;
                 if let (Some(g), Some(_w)) = (self.gpu.as_mut(), self.window.as_ref()) {
                     let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+                    g.relayout(st.view, st.layers, st.experts);
+                    self.overlay.decay(dt);
                     let fs = g.draw(&st, &self.overlay, &mut self.rain, now, dt);
                     self.frames += 1;
                     self.redraws += 1;
@@ -316,6 +447,7 @@ impl ApplicationHandler<()> for App {
                     st.redraw_requests = self.redraws;
                     st.last_frame = fs;
                 }
+                self.last_fp = fp;
             }
             _ => {}
         }
@@ -350,52 +482,52 @@ impl ApplicationHandler<()> for App {
 
 /* ------------------------------------------------------------------ drive */
 
-fn wm_fullscreen() {
-    // WM fullscreen on the monitor the window is on: the compositor keeps the
-    // surface at the monitor's own resolution (1920x1080 here). Deliberately NOT
-    // winit Borderless(4K): that path was measured to stall the swapchain at
-    // 1 fps. The window is addressed by title, so this never fullscreens
-    // whichever window happens to be focused.
-    std::thread::sleep(Duration::from_millis(250));
-    if std::env::var("HYPRLAND_INSTANCE_SIGNATURE").unwrap_or_default().is_empty() {
-        eprintln!("wm-fullscreen: no HYPRLAND_INSTANCE_SIGNATURE, leaving the window tiled");
-        return;
-    }
-    // Hyprland >= 0.56 takes Lua dispatcher calls here. The window has to be
-    // mapped before the dispatch can match it, so retry until the compositor
-    // reports this window at fullscreen=2 (checking, never blind-toggling).
-    let call = format!(
-        "hl.dsp.window.fullscreen_state({{internal=2, client=2, window=\"title:{TITLE}\"}})"
-    );
-    for attempt in 1..=10 {
-        match client_geometry() {
-            Some((size, 2)) => {
-                eprintln!("wm-fullscreen: window {size} fullscreen=2");
-                return;
-            }
-            Some((size, fs)) => eprintln!("wm-fullscreen: attempt {attempt}: window {size} fullscreen={fs}"),
-            None => eprintln!("wm-fullscreen: attempt {attempt}: window not mapped yet"),
-        }
-        match std::process::Command::new("hyprctl").args(["dispatch", &call]).output() {
-            Ok(o) => {
-                let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if out != "ok" {
-                    eprintln!("wm-fullscreen: hyprctl dispatch -> {out}");
-                }
-            }
-            Err(e) => {
-                eprintln!("wm-fullscreen: hyprctl unavailable ({e}), leaving the window tiled");
-                return;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(300));
-    }
-    eprintln!("wm-fullscreen: gave up; window stays as the compositor left it");
+fn hypr_env_ok() -> bool {
+    !std::env::var("HYPRLAND_INSTANCE_SIGNATURE").unwrap_or_default().is_empty()
 }
 
-/// Ask Hyprland for this window's size and fullscreen state. Read-only: the app
-/// never writes window rules or touches other windows.
-fn client_geometry() -> Option<(String, i64)> {
+struct MonInfo {
+    id: i64,
+    name: String,
+    focused: bool,
+    w: f64,
+    h: f64,
+    scale: f64,
+}
+
+fn monitors() -> Vec<MonInfo> {
+    let out = match std::process::Command::new("hyprctl").args(["-j", "monitors"]).output() {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let v = match json::parse(&out.stdout) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let list = match v {
+        json::Value::Arr(a) => a,
+        _ => return Vec::new(),
+    };
+    let mut res = Vec::new();
+    for m in list {
+        let name = m.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        if name.is_empty() {
+            continue;
+        }
+        res.push(MonInfo {
+            id: m.get("id").and_then(|x| x.as_i64()).unwrap_or(-1),
+            name,
+            focused: matches!(m.get("focused"), Some(json::Value::Bool(true))),
+            w: m.get("width").and_then(|x| x.as_f64()).unwrap_or(0.0),
+            h: m.get("height").and_then(|x| x.as_f64()).unwrap_or(0.0),
+            scale: m.get("scale").and_then(|x| x.as_f64()).unwrap_or(1.0),
+        });
+    }
+    res
+}
+
+/// This window's client record: (monitor id, x, y, w, h, fullscreen).
+fn client_geometry() -> Option<(i64, i64, i64, i64, i64, i64)> {
     let out = std::process::Command::new("hyprctl").args(["-j", "clients"]).output().ok()?;
     let v = json::parse(&out.stdout).ok()?;
     let list = match v {
@@ -403,25 +535,149 @@ fn client_geometry() -> Option<(String, i64)> {
         _ => return None,
     };
     for c in list {
-        if c.get("title").and_then(|t| t.as_str()) == Some(TITLE) {
-            let w = c.get("size").and_then(|s| match s {
-                json::Value::Arr(a) => a.first().and_then(|z| z.as_i64()),
-                _ => None,
-            });
-            let h = c.get("size").and_then(|s| match s {
-                json::Value::Arr(a) => a.get(1).and_then(|z| z.as_i64()),
-                _ => None,
-            });
-            let fs = c.get("fullscreen").and_then(|z| z.as_i64()).unwrap_or(-1);
-            return Some((format!("{}x{}", w.unwrap_or(0), h.unwrap_or(0)), fs));
+        if c.get("title").and_then(|t| t.as_str()) != Some(TITLE) {
+            continue;
         }
+        let num = |k: &str, i: usize| -> i64 {
+            c.get(k)
+                .and_then(|s| match s {
+                    json::Value::Arr(a) => a.get(i).and_then(|z| z.as_i64()),
+                    other => other.as_i64(),
+                })
+                .unwrap_or(-1)
+        };
+        let fs = c.get("fullscreen").and_then(|z| z.as_i64()).unwrap_or(-1);
+        return Some((num("monitor", 0), num("at", 0), num("at", 1), num("size", 0), num("size", 1), fs));
     }
     None
 }
 
+fn dispatch(call: &str) -> String {
+    match std::process::Command::new("hyprctl").args(["dispatch", call]).output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Err(e) => format!("hyprctl unavailable: {e}"),
+    }
+}
+
+/// Place the window on `target` (or the focused monitor when None), ask for WM
+/// fullscreen, then read the result back from the compositor and record what was
+/// actually achieved. The app never assumes the placement it asked for.
+fn placement_task(target: Option<String>, st: Arc<Mutex<State>>) {
+    std::thread::sleep(Duration::from_millis(300));
+    if !hypr_env_ok() {
+        let mut s = st.lock().unwrap_or_else(|p| p.into_inner());
+        s.placement.requested = target.clone().unwrap_or_else(|| "active".into());
+        s.placement.note = "no HYPRLAND_INSTANCE_SIGNATURE: placement not verified".into();
+        eprintln!("placement: no HYPRLAND_INSTANCE_SIGNATURE, leaving the window tiled");
+        return;
+    }
+    let mons = monitors();
+    let want = match &target {
+        Some(t) => t.clone(),
+        None => mons.iter().find(|m| m.focused).map(|m| m.name.clone()).unwrap_or_default(),
+    };
+    {
+        let mut s = st.lock().unwrap_or_else(|p| p.into_inner());
+        s.placement.requested = target.clone().unwrap_or_else(|| "active".into());
+    }
+    let fs_call = format!("hl.dsp.window.fullscreen_state({{internal=2, client=2, window=\"title:{TITLE}\"}})");
+    let mv_call = format!("hl.dsp.window.move({{window=\"title:{TITLE}\", monitor=\"{want}\"}})");
+    for attempt in 1..=12 {
+        if target.is_some() {
+            let r = dispatch(&mv_call);
+            if r != "ok" {
+                eprintln!("placement: move -> {r}");
+            }
+        }
+        let r = dispatch(&fs_call);
+        if r != "ok" {
+            eprintln!("placement: fullscreen -> {r}");
+        }
+        std::thread::sleep(Duration::from_millis(320));
+        if let Some((mid, x, y, w, h, fs)) = client_geometry() {
+            let mname = mons.iter().find(|m| m.id == mid).map(|m| m.name.clone()).unwrap_or_default();
+            let want_m = mons.iter().find(|m| m.name == want);
+            let size_ok = match want_m {
+                Some(m) => m.w > 0.0
+                    && ((w as f64) - m.w / m.scale).abs() <= 3.0
+                    && ((h as f64) - m.h / m.scale).abs() <= 3.0,
+                None => false,
+            };
+            let ok = mname == want && fs == 2 && size_ok;
+            {
+                let mut s = st.lock().unwrap_or_else(|p| p.into_inner());
+                s.placement.monitor = mname.clone();
+                s.placement.monitor_id = mid;
+                s.placement.x = x;
+                s.placement.y = y;
+                s.placement.w = w;
+                s.placement.h = h;
+                s.placement.fullscreen = fs;
+                s.placement.verified = ok;
+                s.placement.note = if ok {
+                    format!("window on {mname} {w}x{h} at {x},{y}, fullscreen=2 (verified against hyprctl)")
+                } else {
+                    format!("attempt {attempt}: on {mname:?} {w}x{h} fullscreen={fs}, wanted {want:?} size {size_ok}")
+                };
+            }
+            if ok {
+                eprintln!("placement: window on {} {}x{} at {},{} fullscreen=2 (asked for {})", mname, w, h, x, y, want);
+                return;
+            }
+            eprintln!("placement: attempt {attempt}: on {mname:?} {w}x{h} fs {fs}, wanted {want:?}");
+        } else {
+            eprintln!("placement: attempt {attempt}: window not mapped yet");
+        }
+    }
+    eprintln!("placement: gave up; the dump records what the compositor actually did");
+}
+
+/// Read-only placement probe (used with --wm-fullscreen off).
+fn read_placement(requested: String, st: Arc<Mutex<State>>, _fs: bool) {
+    std::thread::sleep(Duration::from_millis(700));
+    if !hypr_env_ok() {
+        return;
+    }
+    let mons = monitors();
+    if let Some((mid, x, y, w, h, fs)) = client_geometry() {
+        let mname = mons.iter().find(|m| m.id == mid).map(|m| m.name.clone()).unwrap_or_default();
+        let mut s = st.lock().unwrap_or_else(|p| p.into_inner());
+        s.placement.requested = requested.clone();
+        s.placement.monitor = mname;
+        s.placement.monitor_id = mid;
+        s.placement.x = x;
+        s.placement.y = y;
+        s.placement.w = w;
+        s.placement.h = h;
+        s.placement.fullscreen = fs;
+        s.placement.verified = false;
+        s.placement.note = "wm-fullscreen off: placement read back, not requested".into();
+    }
+}
+
+fn wm_fullscreen_toggle() {
+    if !hypr_env_ok() {
+        eprintln!("wm-fullscreen: no HYPRLAND_INSTANCE_SIGNATURE, leaving the window alone");
+        return;
+    }
+    let call = format!("hl.dsp.window.fullscreen_state({{internal=2, client=2, window=\"title:{TITLE}\"}})");
+    for _ in 1..=6 {
+        dispatch(&call);
+        std::thread::sleep(Duration::from_millis(250));
+        if let Some((_, _, _, _, _, fs)) = client_geometry() {
+            if fs == 2 {
+                eprintln!("wm-fullscreen: window fullscreen=2");
+                return;
+            }
+        }
+    }
+    eprintln!("wm-fullscreen: gave up; window stays as the compositor left it");
+}
+
 /// Read the collector's recorded `meta` line back from its own SQLite store.
-/// Read-only, one row, only when --meta-db is given and the socket never
-/// delivered a meta event. See State::backfill_meta for why.
+/// Fallback only: the collector now replays its stored meta to every subscriber
+/// at connect, so this is used only when --meta-db is given and the socket never
+/// delivered one. Read-only, one row.
 fn meta_backfill(db: String, st: Arc<Mutex<State>>) {
     for attempt in 1..=6 {
         std::thread::sleep(Duration::from_millis(500));
@@ -481,8 +737,8 @@ fn main() {
     }
     let st = Arc::new(Mutex::new(State::new(std::process::id(), &args.socket, args.rain)));
 
-    // ---- counter dump thread: never touches the GPU or the window, so the
-    // window can stay in ControlFlow::Wait while this keeps the dump current.
+    // ---- counter/panel dump thread: never touches the GPU or the window, so
+    // the window can stay in ControlFlow::Wait while this keeps the dump current.
     if let Some(path) = args.stats.clone() {
         let st2 = st.clone();
         let ms = args.stats_ms;
@@ -535,6 +791,8 @@ fn main() {
         frames: 0,
         spawned: false,
         next_frame: Instant::now(),
+        last_fp: u64::MAX,
+        resize_pending: true,
         args,
     };
     let proxy = event_loop.create_proxy();
@@ -558,8 +816,8 @@ fn main() {
             }
         });
     }
-    eprintln!("matrix-app: socket {} · stats {:?} · rain {}",
-        app.args.socket, app.args.stats, app.args.rain);
+    eprintln!("matrix-app: socket {} · stats {:?} · rain {} · monitor {} · view {}",
+        app.args.socket, app.args.stats, app.args.rain, app.args.monitor, app.args.view);
     event_loop.run_app(&mut app).expect("run_app");
 
     // final dump so a stopped app still leaves its counters behind

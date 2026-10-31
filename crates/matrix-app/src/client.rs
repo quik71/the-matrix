@@ -29,7 +29,6 @@ pub fn spawn(
     stop: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let mut last_wake = Instant::now() - WAKE_MIN_INTERVAL;
         let mut last_err = String::new();
         // An app that is already showing "not connected" must not be woken by
         // every retry: only a state change (or a different error) is news.
@@ -44,7 +43,9 @@ pub fn spawn(
                         return;
                     }
                     proxy();
-                    last_wake = Instant::now();
+                    // One wake budget per connection: the loop below coalesces a
+                    // burst into at most one UI wake every 4 ms.
+                    let mut last_wake = Instant::now() - WAKE_MIN_INTERVAL;
                     let reader = BufReader::with_capacity(1 << 16, stream);
                     let mut reason = "eof".to_string();
                     for line in reader.lines() {
@@ -99,7 +100,6 @@ pub fn spawn(
                             return;
                         }
                         proxy();
-                        last_wake = Instant::now();
                     }
                 }
             }
