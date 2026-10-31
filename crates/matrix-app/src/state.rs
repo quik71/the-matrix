@@ -276,6 +276,13 @@ pub struct State {
     pub redraw_requests: u64,
     pub repaints_unchanged: u64,
     pub wakes_skipped: u64,
+    // why each presented frame happened (change / animation / resize / none)
+    pub requested_frames: u64,
+    pub pending_redraw: bool,
+    pub frames_change: u64,
+    pub frames_anim: u64,
+    pub frames_resize: u64,
+    pub frames_spurious: u64,
     pub last_frame: crate::render::FrameStats,
     pub rain: bool,
 }
@@ -346,6 +353,12 @@ impl State {
             redraw_requests: 0,
             repaints_unchanged: 0,
             wakes_skipped: 0,
+            requested_frames: 0,
+            pending_redraw: false,
+            frames_change: 0,
+            frames_anim: 0,
+            frames_resize: 0,
+            frames_spurious: 0,
             last_frame: Default::default(),
             rain,
         }
@@ -513,6 +526,31 @@ impl State {
             g.bytes.hash(&mut h);
         }
         h.finish()
+    }
+
+    /// Per-group hashes of exactly the values `fingerprint()` covers, so a frame
+    /// drawn without any new message can be attributed to the group that moved.
+    pub fn fingerprint_groups(&self) -> Vec<(&'static str, u64)> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let h = |f: &dyn Fn(&mut DefaultHasher)| {
+            let mut d = DefaultHasher::new();
+            f(&mut d);
+            d.finish()
+        };
+        vec![
+            ("conn", h(&|d| { self.connected.hash(d); self.connect_errors.hash(d); self.connects.hash(d); self.disconnects.hash(d); self.last_disconnect_reason.hash(d); })),
+            ("meta", h(&|d| { self.meta_source.hash(d); self.meta_events.hash(d); self.model.hash(d); self.engine_name.hash(d); self.layers.hash(d); self.experts.hash(d); self.k.hash(d); self.run_id.hash(d); self.collector_version.hash(d); })),
+            ("stream", h(&|d| { self.last_seq.hash(d); self.events_total.hash(d); self.seq_gaps.hash(d); self.seq_missing.hash(d); self.last_event_ts.to_bits().hash(d); })),
+            ("routing", h(&|d| { self.passes.hash(d); self.positions.hash(d); self.records.hash(d); self.current_session.hash(d); })),
+            ("sessions", h(&|d| { self.sessions_started.hash(d); self.sessions_finished.hash(d); self.sessions.len().hash(d); for s in self.sessions.iter() { s.id.hash(d); s.tier.hash(d); s.finished.hash(d); s.seen_records.hash(d); s.seen_passes.hash(d); s.request_delta.hash(d); } })),
+            ("gaps", h(&|d| { self.gaps_seen.hash(d); self.gap_bytes.hash(d); self.skipped_bytes_seen.hash(d); self.replay_seen.hash(d); self.replay_truncated_seen.hash(d); self.gaps.len().hash(d); })),
+            ("perf", h(&|d| { self.perf.as_ref().map(|p| (p.state.clone(), p.tok_s.map(|v| v.to_bits()), p.requests, p.output_tokens, p.delta_requests)).hash(d); self.perf_samples.hash(d); })),
+            ("hw", h(&|d| { self.hw.as_ref().map(|x| (x.util_pct.map(|v| v.to_bits()), x.mem_used_mib.map(|v| v.to_bits()), x.load1.map(|v| v.to_bits()), x.temp_c.map(|v| v.to_bits()))).hash(d); })),
+            ("status", h(&|d| { self.status.as_ref().map(|x| (x.events_per_s.to_bits(), x.records_per_s.to_bits(), x.drops_total, x.sub_sent, x.sub_depth, x.unattributed_requests, x.engine_requests_total)).hash(d); })),
+            ("counts", h(&|d| { self.layer_counts.hash(d); self.expert_counts.hash(d); })),
+            ("ui", h(&|d| { self.view.hash(d); self.sel_layer.hash(d); self.rain.hash(d); self.placement.monitor.hash(d); self.placement.verified.hash(d); self.placement.w.hash(d); self.placement.h.hash(d); })),
+        ]
     }
 
     pub fn hot_experts(&self, n: usize) -> Vec<(usize, u64)> {
@@ -985,11 +1023,15 @@ impl State {
              {{\"name\":\"sessions_finished\",\"status\":\"live\",\"value\":{}}},",
             self.sessions.len(), self.sessions_started, self.sessions_finished
         ));
-        o.push_str(&format!(
-            "{{\"name\":\"current_session\",\"status\":\"{}\",\"value\":{}}},",
-            if self.current_session.is_some() { "live" } else { "unavailable" },
-            self.current_session.as_ref().map(|s| format!("\"{}\"", json::esc(s))).unwrap_or("null".into())
-        ));
+        match &self.current_session {
+            Some(id) => o.push_str(&format!(
+                "{{\"name\":\"current_session\",\"status\":\"live\",\"value\":\"{}\"}},",
+                json::esc(id)
+            )),
+            None => o.push_str(
+                "{\"name\":\"current_session\",\"status\":\"unavailable\",\"reason\":\"no collector session window is open (the engine is idle, or no client has routed through it)\"},",
+            ),
+        }
         let unattributed_sessions = self.sessions.iter().filter(|s| s.tier == "unattributed").count();
         o.push_str(&format!(
             "{{\"name\":\"sessions_by_tier\",\"status\":\"live\",\"value\":{{\"windowed\":{},\"unattributed\":{},\"unknown\":{}}}}},",
@@ -1003,8 +1045,10 @@ impl State {
             self.status.as_ref().map(|s| s.unattributed_requests.to_string()).unwrap_or("null".into())
         ));
         o.push_str(&format!(
-            "{{\"name\":\"foreign_sessions\",\"status\":\"{}\",\"reason\":\"a session is foreign when its request_delta is 0 or its tier is unattributed: the engine is shared, so any client that writes trace bytes opens a window\"}}",
-            if self.sessions.is_empty() { "unavailable" } else { "live" }
+            "{{\"name\":\"foreign_sessions\",\"status\":\"live\",\"value\":{{\"windowed\":{},\"unattributed\":{},\"unknown\":{}}},\"note\":\"a session is foreign when its request_delta is 0 or its tier is unattributed: the engine is shared, so any client that writes trace bytes opens a window\"}}",
+            self.sessions.iter().filter(|s| s.tier == "windowed").count(),
+            unattributed_sessions,
+            self.sessions.iter().filter(|s| s.tier == "unknown").count()
         ));
         o.push_str("],\"sessions\":[");
         for (i, s) in self.sessions.iter().enumerate() {
@@ -1072,11 +1116,13 @@ impl State {
                     "{{\"name\":\"engine_state\",\"status\":\"live\",\"value\":\"{}\"}},",
                     json::esc(if p.state.is_empty() { "unknown" } else { &p.state })
                 ));
-                o.push_str(&format!(
-                    "{{\"name\":\"tok_s\",\"status\":\"{}\",\"value\":{}}},",
-                    if p.tok_s.is_some() { "live" } else { "unavailable" },
-                    fmt_opt(p.tok_s)
-                ));
+                match p.tok_s {
+                    Some(v) => o.push_str(&format!(
+                        "{{\"name\":\"tok_s\",\"status\":\"live\",\"value\":{v:.3}}},")),
+                    None => o.push_str(
+                        "{\"name\":\"tok_s\",\"status\":\"unavailable\",\"reason\":\"the engine's live.tok_s field was null in the most recent /metrics sample (idle or prefill)\"},",
+                    ),
+                }
                 o.push_str(&format!(
                     "{{\"name\":\"requests_total\",\"status\":\"{}\",\"value\":{}}},",
                     if p.requests.is_some() { "live" } else { "unavailable" },
@@ -1416,8 +1462,10 @@ impl State {
         o.push_str(&self.panels());
         o.push(',');
 
-        o.push_str(&format!("\"rain\":{},\"frames\":{},\"redraw_requests\":{},\"repaints_unchanged\":{},\"wakes_skipped\":{},\"last_frame\":{{\"quads\":{},\"glyphs\":{},\"lamps\":{},\"streams\":{}}}",
+        o.push_str(&format!("\"rain\":{},\"frames\":{},\"redraw_requests\":{},\"repaints_unchanged\":{},\"wakes_skipped\":{},\"requested_frames\":{},\"pending_redraw\":{},\"frames_change\":{},\"frames_anim\":{},\"frames_resize\":{},\"frames_spurious\":{},\"last_frame\":{{\"quads\":{},\"glyphs\":{},\"lamps\":{},\"streams\":{}}}",
             self.rain, self.frames, self.redraw_requests, self.repaints_unchanged, self.wakes_skipped,
+            self.requested_frames, self.pending_redraw,
+            self.frames_change, self.frames_anim, self.frames_resize, self.frames_spurious,
             self.last_frame.quads, self.last_frame.glyphs, self.last_frame.lamps, self.last_frame.streams));
         o.push('}');
         o

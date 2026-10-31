@@ -193,6 +193,18 @@ struct App {
     next_frame: Instant,
     last_fp: u64,
     resize_pending: bool,
+    /// Set when the loop asked for a redraw because a lamp was still fading or
+    /// the rain was running; a frame inside this grace window is animation, not
+    /// a redundant repaint.
+    anim_until: Instant,
+    /// messages applied since the previous presented frame (diagnostic for the
+    /// "a frame was drawn without any new data" case)
+    msgs_since_draw: u64,
+    /// the outstanding redraw was requested by the animation tick
+    req_anim: bool,
+    /// a redraw was requested because a displayed value changed
+    req_change: bool,
+    last_groups: Vec<(&'static str, u64)>,
 }
 
 impl App {
@@ -240,6 +252,7 @@ impl App {
                 }
                 Err(_) => break,
             }
+            self.msgs_since_draw += 1;
             if got > 200_000 {
                 break;
             }
@@ -262,6 +275,21 @@ impl App {
             let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
             st.wakes_skipped += 1;
             false
+        }
+    }
+
+    /// Ask for one frame and remember that it is still owed: a Wayland client
+    /// cannot force a present, so a request can sit in the compositor for a long
+    /// time (idle session). The dump exposes both the request count and whether
+    /// one is still pending, which is what makes the idle measurement honest.
+    fn request_frame(&mut self) {
+        if let Some(w) = self.window.as_ref() {
+            {
+                let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+                st.requested_frames += 1;
+                st.pending_redraw = true;
+            }
+            w.request_redraw();
         }
     }
 
@@ -323,15 +351,14 @@ impl ApplicationHandler<()> for App {
             let req = self.args.monitor.clone();
             std::thread::spawn(move || read_placement(req, st2, false));
         }
-        window.request_redraw();
+        self.request_frame();
     }
 
     fn user_event(&mut self, _el: &ActiveEventLoop, _ev: ()) {
         self.drain();
         if self.visual_change() {
-            if let Some(w) = self.window.as_ref() {
-                w.request_redraw();
-            }
+            self.req_change = true;
+            self.request_frame();
         }
     }
 
@@ -346,9 +373,7 @@ impl ApplicationHandler<()> for App {
                         g.layout.w, g.layout.h, g.layout.cell);
                 }
                 self.resize_pending = true;
-                if let Some(w) = self.window.as_ref() {
-                    w.request_redraw();
-                }
+                self.request_frame();
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
@@ -414,13 +439,15 @@ impl ApplicationHandler<()> for App {
                         _ => {}
                     }
                     if dirty {
-                        if let Some(w) = self.window.as_ref() {
-                            w.request_redraw();
-                        }
+                        self.request_frame();
                     }
                 }
             }
             WindowEvent::RedrawRequested => {
+                {
+                    let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+                    st.pending_redraw = false;
+                }
                 self.drain();
                 let now = self.elapsed_ms();
                 let dt = (now - self.last_draw_ms) as f32;
@@ -431,11 +458,43 @@ impl ApplicationHandler<()> for App {
                 };
                 let animating = self.overlay.animating(now);
                 let rain_on = self.st.lock().unwrap_or_else(|p| p.into_inner()).rain;
-                if fp == self.last_fp && !animating && !rain_on && !self.resize_pending {
+                let in_anim_grace = Instant::now() < self.anim_until || self.req_anim;
+                self.req_anim = false;
+                // A compositor can hand us a frame nobody asked for. If every
+                // displayed value is already on screen, presenting an identical
+                // pixel buffer is exactly the "continuous redraw when nothing
+                // changes" the spec forbids: decline it and count it.
+                let redundant = fp == self.last_fp && !animating && !rain_on
+                    && !self.resize_pending && !in_anim_grace && !self.req_change;
+                self.req_change = false;
+                if redundant && self.last_fp != u64::MAX {
                     let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
                     st.repaints_unchanged += 1;
+                    st.pending_redraw = false;
+                    return;
+                }
+                {
+                    let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+                    if self.resize_pending {
+                        st.frames_resize += 1;
+                    } else if fp != self.last_fp {
+                        st.frames_change += 1;
+                        if self.msgs_since_draw == 0 {
+                            // a frame drawn with no new message: attribute it
+                            let g = st.fingerprint_groups();
+                            let changed: Vec<&str> = g.iter().zip(self.last_groups.iter())
+                                .filter(|((_, a), (_, b))| a != b).map(|((n, _), _)| *n).collect();
+                            eprintln!("frame: state groups changed without a new message: {:?}", changed);
+                        }
+                    } else if animating || rain_on || in_anim_grace {
+                        st.frames_anim += 1;
+                    } else {
+                        st.frames_spurious += 1;
+                        st.repaints_unchanged += 1;
+                    }
                 }
                 self.resize_pending = false;
+                self.msgs_since_draw = 0;
                 if let (Some(g), Some(_w)) = (self.gpu.as_mut(), self.window.as_ref()) {
                     let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
                     g.relayout(st.view, st.layers, st.experts);
@@ -448,6 +507,10 @@ impl ApplicationHandler<()> for App {
                     st.last_frame = fs;
                 }
                 self.last_fp = fp;
+                {
+                    let st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+                    self.last_groups = st.fingerprint_groups();
+                }
             }
             _ => {}
         }
@@ -469,9 +532,9 @@ impl ApplicationHandler<()> for App {
             let now_i = Instant::now();
             if now_i >= self.next_frame {
                 self.next_frame = now_i + Duration::from_millis(16);
-                if let Some(w) = self.window.as_ref() {
-                    w.request_redraw();
-                }
+                self.anim_until = now_i + Duration::from_millis(48);
+                self.req_anim = true;
+                self.request_frame();
             }
             el.set_control_flow(ControlFlow::WaitUntil(self.next_frame));
         } else {
@@ -614,6 +677,8 @@ fn placement_task(target: Option<String>, st: Arc<Mutex<State>>) {
                 s.placement.h = h;
                 s.placement.fullscreen = fs;
                 s.placement.verified = ok;
+                eprintln!("placement-write at {:.1}s: verified={} monitor={:?} {}x{}",
+                    crate::now_unix() - s.started_wall, ok, mname, w, h);
                 s.placement.note = if ok {
                     format!("window on {mname} {w}x{h} at {x},{y}, fullscreen=2 (verified against hyprctl)")
                 } else {
@@ -793,6 +858,11 @@ fn main() {
         next_frame: Instant::now(),
         last_fp: u64::MAX,
         resize_pending: true,
+        anim_until: Instant::now(),
+        msgs_since_draw: 0,
+        req_anim: false,
+        req_change: false,
+        last_groups: Vec::new(),
         args,
     };
     let proxy = event_loop.create_proxy();
