@@ -205,8 +205,11 @@ class Traffic(threading.Thread):
         while not STOP.is_set():
             path = "proxy" if self.i % 2 == 0 else "direct"
             self.one(path)
-            # a little jitter keeps the load from being perfectly periodic
-            STOP.wait(48 + (self.i % 5) * 7)
+            # a little jitter keeps the load from being perfectly periodic;
+            # 22-38 s between generations gives a sustained ~15-25% duty cycle
+            # (long enough to keep the collector, DB and renderer under load
+            # without turning the soak into a benchmark)
+            STOP.wait(22 + (self.i % 5) * 4)
 
 
 EXT_SRC = r'''#!/usr/bin/env python3
