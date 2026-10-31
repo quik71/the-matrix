@@ -178,7 +178,8 @@ class Traffic(threading.Thread):
     def one(self, path):
         prompt = PROMPTS[self.i % len(PROMPTS)]
         self.i += 1
-        max_tokens = [64, 96, 128, 160][self.i % 4]
+        # brief: own generations request max_tokens=150, alternating proxy/direct
+        max_tokens = 150
         body = json.dumps({"model": "qwen3.8-flash-next-iq3_s",
                            "messages": [{"role": "user", "content": prompt}],
                            "max_tokens": max_tokens, "temperature": 0}).encode()

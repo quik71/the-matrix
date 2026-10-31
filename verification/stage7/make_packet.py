@@ -188,7 +188,13 @@ def main():
         "output_excerpt": json.dumps({"claims": [c["id"] for c in claims],
                                       "checks": {k: v.get("ok") for k, v in checks.items()}})[:1200],
         "artifact_paths": [os.path.join(ART, "packet.json"), os.path.join(ART, "results7.json")],
-        "ok": ok("S7-A8"),
+        # A8 is the packet's own completeness statement, so it is evaluated from
+        # the packet rather than from results7: reading results7's S7-A8 here is
+        # circular (the check cannot pass until the packet claims it passed, and
+        # the claim cannot pass until the check has run). Same predicate the
+        # check applies: every earlier claim ok and every referenced path real.
+        "ok": (all(c["ok"] for c in claims)
+               and not [p for c in claims for p in c["artifact_paths"] if not os.path.exists(p)]),
     })
 
     packet = {
