@@ -50,6 +50,7 @@ does not expose are **absent**, never zero-filled.
 | `hw_sample` | `gpu` (nvidia-smi: name, util, mem, temp, power), `cpu.load1`, `mem.available_mib`, `proc.rss_kib` |
 | `telemetry_status` | `rates`, `subscribers`, `per_subscriber` (depth, max_depth, sent, `dropped_droppable`, `forced_drops`, `replayed`, `replay_truncated`), `queue_cap`, `drops_total`, `skipped_bytes_total`, `gap_bytes_total`, `db` health, `trace` offsets, `session_active`, `unattributed_requests` |
 | `gap` | `reason`, `byte_start`, `byte_end`, `bytes`, `records_unattributed`, `detail` |
+| `residency_estimate` | `status` (`estimate`\|`unavailable`), `basis`, `confirmed:false`, `policy`, `profile` (STRP header), `slots` (engine `expert_slots`), `tiers` (vram/ram/ssd pair counts), `vram_cells` (flat layer*experts+expert indices) |
 
 ## Session windows
 
@@ -95,7 +96,37 @@ so a `kill -9` cannot leave a routing row without its event.
 session slice.
 
 `--retention-days N` (default 30) prunes `hw` and `status` only; `routing`,
-`passes`, `sessions` and `events` are never pruned.
+`passes`, `sessions` and non-routing `events` are never pruned.
+
+`--event-line-hours N` (default 1) bounds the *duplicate* `expert_selected`
+lines in `events`: `routing` already carries every record, and schema v2 adds
+`routing.ts` + `routing.byte_len`, so the canonical line is rebuilt
+byte-for-byte on replay and export. Compaction only touches finished sessions
+whose routing projection provably accounts for every one of their event lines,
+so nothing is lost — proven on a copied fixture (replay sha256 identical before
+and after, export `events.ndjson` identical before and after). A session with
+any unreconstructable row is skipped and counted (`sessions_skipped`).
+
+### Offline maintenance (no tailing, no socket)
+
+```
+matrix-collect --db <db> --prune --retention-days 30 --event-line-hours 1 [--vacuum]
+matrix-collect --db <db> --export <dir>
+```
+
+`--prune` prints one JSON object with per-table counts before/after, what was
+pruned (`hw`, `status`), what was compacted, `routing_pruned: 0`,
+`PRAGMA integrity_check`, and `dbstat` bytes per table before/after — the size
+math comes from the database, not from a spreadsheet.
+
+`--export <dir>` is read-only and writes `events.ndjson` (stored lines merged
+with reconstructed ones in seq order), one NDJSON per projection table
+(`sessions`, `passes`, `routing`, `perf`, `hw`, `status`, `gaps`),
+`summary.json` (counts, per-session summary, expert/layer histograms, perf/hw
+aggregates, gaps by reason, `identity`) and the file list with line/byte
+counts. `identity.equal` is the machine-checked rule: *events rows + routing
+rows without a stored line = events.ndjson lines*, and every per-class archive
+line count equals its table row count.
 
 `--no-persist` runs without SQLite (transport still works, replay is off).
 
@@ -163,9 +194,14 @@ Keys: `esc` quit, `r` toggle rain, `f` WM-fullscreen.
 Panels that have no data say `unavailable`; surfaces not built at this stage
 say `not implemented this stage` and name what is missing. The v1 stream has no
 token text and no scores, so both are labelled unavailable rather than faked.
-Expert *residency* is not in the v1 stream either, so the lattice is drawn as
-geometry only (real 48 × 512 dimensions from `meta`) and no residency is
-painted.
+Expert *residency* is not in the v1 stream. What is painted is a labelled
+**estimate**: the collector reads the model's own STRP profile (pairs ranked by
+routing frequency) and the engine's own `expert_slots`, and emits one
+`residency_estimate` event with the first `slots` pairs as the VRAM set and the
+rest as RAM (there is no per-expert SSD state in this deployment). Those cells
+get a quiet tint, the panel field `expert_residency` stays `unavailable` and
+says why, and the dump carries `residency.status:"estimate"`,
+`confirmed:false` plus the painted cell count — never live truth.
 
 ## Present-on-demand
 

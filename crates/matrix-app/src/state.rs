@@ -401,6 +401,40 @@ pub struct State {
     pub frames_spurious: u64,
     pub last_frame: crate::render::FrameStats,
     pub rain: bool,
+    // ---- Stage 7: residency estimate + frame-time distribution
+    pub residency: Option<Residency>,
+    pub res_epoch: u64,
+    pub residency_events: u64,
+    pub frame_hist: [u64; FRAME_BUCKETS],
+    pub frame_samples: u64,
+    pub frame_max_ms: f32,
+}
+
+/// Frame intervals are bucketed in 5 ms steps 0..160 ms plus one overflow
+/// bucket. Cumulative counts let an external sampler diff two dumps and get the
+/// exact p95 of that interval — the soak's drift metric — without the app
+/// keeping any per-frame history.
+pub const FRAME_BUCKETS: usize = 33;
+
+/// Stage 7 residency: an ESTIMATE derived from model structure (the STRP
+/// expert profile's ranked prefix + the engine's own expert_slots), never a
+/// live per-expert truth. The engine emits no residency events and its cache
+/// never evicts; the collector labels every field `estimate` and the app keeps
+/// that label in the dump and on the lattice.
+pub struct Residency {
+    pub status: String,
+    pub basis: String,
+    pub source: String,
+    pub confirmed: bool,
+    pub policy: String,
+    pub slots: u64,
+    pub vram: u64,
+    pub ram: u64,
+    pub ssd: u64,
+    pub layers: usize,
+    pub experts: usize,
+    pub cells: Vec<bool>,
+    pub reason: String,
 }
 
 impl State {
@@ -503,7 +537,48 @@ impl State {
             frames_spurious: 0,
             last_frame: Default::default(),
             rain,
+            residency: None,
+            res_epoch: 0,
+            residency_events: 0,
+            frame_hist: [0; FRAME_BUCKETS],
+            frame_samples: 0,
+            frame_max_ms: 0.0,
         }
+    }
+
+    /// Record one presented frame's interval (ms). Intervals above 5 s are the
+    /// window's first frame after a long idle period and are not animation cost:
+    /// they are counted separately instead of poisoning p95.
+    pub fn record_frame_ms(&mut self, ms: f32) {
+        if !ms.is_finite() || ms < 0.0 {
+            return;
+        }
+        if ms > 5000.0 {
+            return;
+        }
+        let b = ((ms / 5.0).floor() as usize).min(FRAME_BUCKETS - 1);
+        self.frame_hist[b] += 1;
+        self.frame_samples += 1;
+        if ms > self.frame_max_ms {
+            self.frame_max_ms = ms;
+        }
+    }
+
+    /// Percentile (0..1) of the cumulative frame-interval histogram, in ms.
+    pub fn frame_pct(&self, q: f32) -> f32 {
+        if self.frame_samples == 0 {
+            return 0.0;
+        }
+        let target = (self.frame_samples as f64 * q.clamp(0.0, 1.0) as f64).ceil() as u64;
+        let mut acc = 0u64;
+        for (i, n) in self.frame_hist.iter().enumerate() {
+            acc += *n;
+            if acc >= target.max(1) {
+                // report the top edge of the bucket: conservative, never optimistic
+                return ((i as f32 + 1.0) * 5.0).min(165.0);
+            }
+        }
+        165.0
     }
 
     pub fn session(&self, id: &str) -> Option<&Session> {
@@ -690,7 +765,7 @@ impl State {
         };
         vec![
             ("conn", h(&|d| { self.connected.hash(d); self.connect_errors.hash(d); self.connects.hash(d); self.disconnects.hash(d); self.last_disconnect_reason.hash(d); })),
-            ("meta", h(&|d| { self.meta_source.hash(d); self.meta_events.hash(d); self.model.hash(d); self.engine_name.hash(d); self.layers.hash(d); self.experts.hash(d); self.k.hash(d); self.run_id.hash(d); self.collector_version.hash(d); })),
+            ("meta", h(&|d| { self.meta_source.hash(d); self.meta_events.hash(d); self.model.hash(d); self.engine_name.hash(d); self.layers.hash(d); self.experts.hash(d); self.k.hash(d); self.run_id.hash(d); self.collector_version.hash(d); self.res_epoch.hash(d); self.residency_events.hash(d); })),
             ("stream", h(&|d| { self.last_seq.hash(d); self.events_total.hash(d); self.seq_gaps.hash(d); self.seq_missing.hash(d); self.last_event_ts.to_bits().hash(d); })),
             ("routing", h(&|d| { self.passes.hash(d); self.positions.hash(d); self.records.hash(d); self.current_session.hash(d); })),
             ("sessions", h(&|d| { self.sessions_started.hash(d); self.sessions_finished.hash(d); self.sessions.len().hash(d); for s in self.sessions.iter() { s.id.hash(d); s.tier.hash(d); s.finished.hash(d); s.seen_records.hash(d); s.seen_passes.hash(d); s.request_delta.hash(d); } })),
@@ -876,7 +951,11 @@ impl State {
             // `gap` is a statement about the stream, not a data event: it is
             // replayed to late subscribers alongside meta, carries its own
             // byte/record accounting, and never moves `last_seq`.
-            let is_meta = typ == "meta" || typ == "gap";
+            // residency_estimate is emitted once by the collector right after
+            // meta and replayed alongside it: idempotent structure, not a data
+            // event, so it never moves `last_seq` (a compaction/restart must not
+            // look like a seq hole).
+            let is_meta = typ == "meta" || typ == "gap" || typ == "residency_estimate";
             if !is_meta && self.last_seq >= 0 && seq <= self.last_seq {
                 if ts > self.last_ts + 0.001 {
                     // A collector that restarted against a fresh database
@@ -1111,6 +1190,52 @@ impl State {
                 h.mem_available_mib = v.path(&["mem", "available_mib"]).and_then(|z| z.as_f64());
                 h.rss_kib = v.path(&["proc", "rss_kib"]).and_then(|z| z.as_i64());
                 self.hw = Some(h);
+            }
+            "residency_estimate" => {
+                self.residency_events += 1;
+                let status = v.get("status").and_then(|z| z.as_str()).unwrap_or("unavailable").to_string();
+                let gs = |k: &str| v.get(k).and_then(|z| z.as_str()).unwrap_or("").to_string();
+                let gu = |k: &str| v.get(k).and_then(|z| z.as_i64()).unwrap_or(0).max(0) as u64;
+                let tp = |k: &str| v.path(&["tiers", k]).and_then(|z| z.as_i64()).unwrap_or(0).max(0) as u64;
+                let layers = v.path(&["profile", "layers"]).and_then(|z| z.as_i64())
+                    .map(|x| x.max(0) as usize).filter(|x| *x > 0 && *x <= LAYER_SLOTS)
+                    .unwrap_or(self.layers);
+                let experts = v.path(&["profile", "experts"]).and_then(|z| z.as_i64())
+                    .map(|x| x.max(0) as usize).filter(|x| *x > 0 && *x <= EXPERT_SLOTS)
+                    .unwrap_or(self.experts);
+                let mut cells = vec![false; layers.saturating_mul(experts)];
+                let mut marked = 0usize;
+                if status == "estimate" {
+                    if let Some(Value::Arr(a)) = v.get("vram_cells") {
+                        for id in a {
+                            if let Some(x) = id.as_i64() {
+                                if x >= 0 && (x as usize) < cells.len() {
+                                    if !cells[x as usize] {
+                                        marked += 1;
+                                    }
+                                    cells[x as usize] = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                self.residency = Some(Residency {
+                    status,
+                    basis: gs("basis"),
+                    source: gs("source"),
+                    confirmed: v.get("confirmed").map(|z| matches!(z, Value::Bool(true))).unwrap_or(false),
+                    policy: gs("policy"),
+                    slots: gu("slots"),
+                    vram: tp("vram"),
+                    ram: tp("ram"),
+                    ssd: tp("ssd"),
+                    layers,
+                    experts,
+                    cells,
+                    reason: gs("reason"),
+                });
+                self.res_epoch += 1;
+                let _ = marked;
             }
             "telemetry_status" => {
                 let mut s = Status {
@@ -1367,8 +1492,24 @@ impl State {
              {{\"name\":\"selected_layer_selections\",\"status\":\"live\",\"value\":{}}},",
             top, self.sel_layer, self.layer_counts.get(self.sel_layer).copied().unwrap_or(0)
         ));
+        // residency: the *truth* stays unavailable and says so; the estimate is
+        // carried in the top-level `residency` block (status "estimate") and
+        // painted on the lattice, so the panel field never pretends to be live.
+        let res_reason = match &self.residency {
+            Some(r) if r.status == "estimate" => format!(
+                "no per-expert residency events exist (the cache pre-fills from a static profile and never evicts); the lattice tint is a labelled ESTIMATE from model structure: {} VRAM-prefix cells, {} RAM cells, {} SSD cells (slots {}), never live truth",
+                r.vram, r.ram, r.ssd, r.slots
+            ),
+            Some(r) if !r.reason.is_empty() => format!("no residency events; estimate unavailable: {}", r.reason),
+            Some(_) => "no per-expert residency events exist and no estimate was sent".to_string(),
+            None => "no residency_estimate event received yet; nothing is painted".to_string(),
+        };
         o.push_str(&format!(
-            "{{\"name\":\"expert_residency\",\"status\":\"unavailable\",\"reason\":\"the v1 event stream carries no per-expert residency (VRAM/RAM/SSD); Stage 1 shows only aggregate cache stats, which are not per-expert and are not drawn as residency\"}},\n\
+            "{{\"name\":\"expert_residency\",\"status\":\"unavailable\",\"reason\":\"{}\"}},",
+            json::esc(&res_reason)
+        ));
+        o.push_str(&format!(
+            "\
              {{\"name\":\"routing_scores\",\"status\":\"unavailable\",\"reason\":\"serve-path weights are all 0.0 in the trace (ids only), so no score exists to display\"}},\n\
              {{\"name\":\"co_activation_matrix\",\"status\":\"live\",\"value\":{{\"records_folded\":{},\"distinct_pairs\":{}}},\"note\":\"pairs counted inside each record's real top-k set; view 6 draws them\"}},\n\
              {{\"name\":\"historical_trails\",\"status\":\"live\",\"value\":{{\"cells_with_history\":{},\"total_selections\":{}}},\"note\":\"per-cell counts with the event timestamps they arrived with (t key toggles the trail bars)\"}},\n\
@@ -1561,7 +1702,7 @@ impl State {
         }
         o.push_str(
             "{\"name\":\"nvme_storage\",\"status\":\"unavailable\",\"reason\":\"hw_sample carries no disk/NVMe fields\"},\
-             {\"name\":\"model_residency_bytes\",\"status\":\"unavailable\",\"reason\":\"no residency telemetry in the v1 stream\"}\
+             {\"name\":\"model_residency_bytes\",\"status\":\"unavailable\",\"reason\":\"no per-tier byte residency exists; the lattice carries a labelled estimate of cells, not bytes\"}\
             ]},");
 
         // ---- model / geometry
@@ -1812,13 +1953,34 @@ impl State {
             json::esc(&self.selftest_last), self.selftest_last_ts));
         o.push_str(",\"note\":\"labelled INPUT SELF-TEST: a control file that injects the same commands the keyboard does (zoom/pan/view/trails). It drives UI state only and never produces telemetry\"},\n");
 
-        o.push_str(&format!("\"rain\":{},\"frames\":{},\"redraw_requests\":{},\"repaints_unchanged\":{},\"wakes_skipped\":{},\"requested_frames\":{},\"pending_redraw\":{},\"frames_change\":{},\"frames_anim\":{},\"frames_resize\":{},\"frames_spurious\":{},\"last_frame\":{{\"quads\":{},\"glyphs\":{},\"lamps\":{},\"streams\":{},\"trail_quads\":{},\"pulse_quads\":{},\"banner_quads\":{},\"visible_cells\":{},\"rain_families\":{}}}",
+        o.push_str(&format!("\"rain\":{},\"frames\":{},\"redraw_requests\":{},\"repaints_unchanged\":{},\"wakes_skipped\":{},\"requested_frames\":{},\"pending_redraw\":{},\"frames_change\":{},\"frames_anim\":{},\"frames_resize\":{},\"frames_spurious\":{},\"last_frame\":{{\"quads\":{},\"glyphs\":{},\"lamps\":{},\"streams\":{},\"trail_quads\":{},\"pulse_quads\":{},\"banner_quads\":{},\"visible_cells\":{},\"rain_families\":{},\"res_cells\":{},\"res_len\":{},\"res_epoch_seen\":{}}}",
             self.rain, self.frames, self.redraw_requests, self.repaints_unchanged, self.wakes_skipped,
             self.requested_frames, self.pending_redraw,
             self.frames_change, self.frames_anim, self.frames_resize, self.frames_spurious,
             self.last_frame.quads, self.last_frame.glyphs, self.last_frame.lamps, self.last_frame.streams,
             self.last_frame.trail_quads, self.last_frame.pulse_quads, self.last_frame.banner_quads,
-            self.last_frame.visible_cells, self.last_frame.families));
+            self.last_frame.visible_cells, self.last_frame.families,
+            self.last_frame.res_cells, self.last_frame.res_len, self.last_frame.res_epoch_seen));
+        let (rstatus, rbasis, rconf, rslots, rvram, rram, rssd, rreason, rlayers, rexperts, rpolicy, rsource) =
+            match &self.residency {
+                Some(r) => (r.status.clone(), r.basis.clone(), r.confirmed, r.slots, r.vram, r.ram, r.ssd,
+                            r.reason.clone(), r.layers, r.experts, r.policy.clone(), r.source.clone()),
+                None => ("none".into(), String::new(), false, 0, 0, 0, 0,
+                         "no residency_estimate event received".into(), self.layers, self.experts,
+                         String::new(), String::new()),
+            };
+        o.push_str(&format!(
+            ",\"residency\":{{\"events\":{},\"status\":\"{}\",\"basis\":\"{}\",\"confirmed\":{},\"slots\":{},\"vram_cells\":{},\"ram_cells\":{},\"ssd_cells\":{},\"layers\":{},\"experts\":{},\"painted\":{},\"epoch\":{},\"policy\":\"{}\",\"source\":\"{}\",\"reason\":\"{}\"}}",
+            self.residency_events, json::esc(&rstatus), json::esc(&rbasis), rconf, rslots,
+            rvram, rram, rssd, rlayers, rexperts, self.last_frame.res_cells, self.res_epoch,
+            json::esc(&rpolicy), json::esc(&rsource), json::esc(&rreason)
+        ));
+        let hist: Vec<String> = self.frame_hist.iter().map(|v| v.to_string()).collect();
+        o.push_str(&format!(
+            ",\"frame_ms\":{{\"samples\":{},\"bucket_ms\":5,\"p50\":{:.1},\"p95\":{:.1},\"p99\":{:.1},\"max\":{:.1},\"hist\":[{}]}}",
+            self.frame_samples, self.frame_pct(0.50), self.frame_pct(0.95), self.frame_pct(0.99),
+            self.frame_max_ms, hist.join(",")
+        ));
         o.push('}');
         o
     }

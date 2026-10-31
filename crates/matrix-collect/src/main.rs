@@ -65,6 +65,11 @@ struct Cfg {
     hw_ms: u64,
     start_offset: Option<u64>,
     quiet_ms: u64,
+    expert_profile: String,
+    event_line_hours: f64,
+    prune: bool,
+    export: Option<String>,
+    vacuum: bool,
 }
 
 impl Default for Cfg {
@@ -87,6 +92,11 @@ impl Default for Cfg {
             hw_ms: 5000,
             start_offset: None,
             quiet_ms: 600,
+            expert_profile: "/home/main/strata-0.2.4.2/data/expert-profile.bin".into(),
+            event_line_hours: 1.0,
+            prune: false,
+            export: None,
+            vacuum: false,
         }
     }
 }
@@ -167,6 +177,26 @@ fn parse_args() -> Result<Cfg, String> {
             }
             "--replay" => {
                 c.replay = Some(need(i)?);
+                i += 2;
+            }
+            "--expert-profile" => {
+                c.expert_profile = need(i)?;
+                i += 2;
+            }
+            "--event-line-hours" => {
+                c.event_line_hours = need(i)?.parse().map_err(|_| "--event-line-hours")?;
+                i += 2;
+            }
+            "--prune" => {
+                c.prune = true;
+                i += 1;
+            }
+            "--vacuum" => {
+                c.vacuum = true;
+                i += 1;
+            }
+            "--export" => {
+                c.export = Some(need(i)?);
                 i += 2;
             }
             "--help" | "-h" => {
@@ -352,6 +382,10 @@ struct Core {
     /// Additive to the v1 contract: the line is byte-identical to the one in the
     /// store, and a subscriber that was already attached never sees a second one.
     meta_line: Option<String>,
+    /// Same contract for the one-shot residency ESTIMATE: the line is recorded
+    /// once and handed to every later subscriber, labelled estimate, so a late
+    /// client can paint the structural tint without reading the DB.
+    res_line: Option<String>,
 }
 
 impl Core {
@@ -371,6 +405,9 @@ impl Core {
         line.push('}');
         if kind == "meta" {
             self.meta_line = Some(line.clone());
+        }
+        if kind == "residency_estimate" {
+            self.res_line = Some(line.clone());
         }
         self.events_total += 1;
         {
@@ -940,6 +977,7 @@ impl Core {
                         &r.weights,
                         r.off,
                         eseq,
+                        now_unix(),
                     ) {
                         self.db_ok = false;
                         self.db_err = e;
@@ -1003,6 +1041,13 @@ impl Core {
                     eprintln!("subscriber {}: meta-on-connect ({} bytes)", sub.name, lines[0].len());
                 }
             }
+            if let Some(rl) = self.res_line.clone() {
+                let already = lines.iter().any(|l| l.contains("residency_estimate"));
+                if !already {
+                    let at = if lines.first().map(|l| l.contains("\"type\":\"meta\"")).unwrap_or(false) { 1 } else { 0 };
+                    lines.insert(at, rl);
+                }
+            }
             // Gaps that happened before this subscriber attached (a restart, a
             // discarded pass). Additive like meta-on-connect: the bytes are the
             // recorded ones, and a fresh subscriber sees at most 8 of them.
@@ -1055,6 +1100,160 @@ impl Core {
     }
 }
 
+// ------------------------------------------------- Stage 7: offline maintenance
+fn run_maintenance(cfg: &Cfg) -> ! {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(dir) = cfg.export.as_ref() {
+        let st = match Store::open_readonly(&cfg.db) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("{{\"ok\":false,\"mode\":\"export\",\"error\":\"{}\"}}", json::esc(&e));
+                process::exit(2);
+            }
+        };
+        match st.export(dir) {
+            Ok(ex) => parts.push(format!(
+                "\"export\":{{\"ok\":true,\"dir\":\"{}\",\"events_lines\":{},\"reconstructed\":{},\"logical_events\":{},\"identity_equal\":{},\"sessions\":{},\"passes\":{},\"routing\":{},\"perf\":{},\"hw\":{},\"status\":{},\"gaps\":{},\"summary\":\"{}/summary.json\",\"reconstruction\":\"{}\"}}",
+                json::esc(dir),
+                ex.events_lines, ex.reconstructed, ex.logical_events, ex.identity_equal,
+                ex.sessions, ex.passes, ex.routing, ex.perf, ex.hw, ex.status, ex.gaps,
+                dir,
+                if st.has_ts { "routing.ts/byte_len" } else { "unavailable (schema v1: no routing.ts)" }
+            )),
+            Err(e) => {
+                println!("{{\"ok\":false,\"mode\":\"export\",\"error\":\"{}\"}}", json::esc(&e));
+                process::exit(2);
+            }
+        }
+    }
+    if cfg.prune {
+        let mut st = match Store::open(&cfg.db) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("{{\"ok\":false,\"mode\":\"prune\",\"error\":\"{}\"}}", json::esc(&e));
+                process::exit(2);
+            }
+        };
+        let before = st.counts();
+        let before_b = st.db_bytes();
+        let before_tables = st.table_bytes();
+        let (hw, stt) = match st.prune(cfg.retention_days) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("{{\"ok\":false,\"mode\":\"prune\",\"error\":\"{}\"}}", json::esc(&e));
+                process::exit(2);
+            }
+        };
+        let comp = match st.compact_event_lines(cfg.event_line_hours, cfg.vacuum) {
+            Ok(c) => c,
+            Err(e) => {
+                println!("{{\"ok\":false,\"mode\":\"prune\",\"error\":\"{}\"}}", json::esc(&e));
+                process::exit(2);
+            }
+        };
+        let after = st.counts();
+        let after_b = st.db_bytes();
+        let after_tables = st.table_bytes();
+        let integrity = st.check_integrity();
+        let tb = |v: &[(String, u64)]| -> String {
+            let mut m = String::from("{");
+            let mut first = true;
+            for (n, b) in v {
+                if !first {
+                    m.push(',');
+                }
+                first = false;
+                m.push_str(&format!("\"{}\":{}", json::esc(n), b));
+            }
+            m.push('}');
+            m
+        };
+        parts.push(format!(
+            "\"prune\":{{\"ok\":true,\"db\":\"{}\",\"retention_days\":{},\"event_line_hours\":{},\"vacuum\":{},\
+\"hw_pruned\":{},\"status_pruned\":{},\"routing_pruned\":0,\"passes_pruned\":0,\"sessions_pruned\":0,\"events_pruned_other\":0,\
+\"event_lines_compacted\":{},\"sessions_compacted\":{},\"sessions_skipped\":{},\"cutoff_ts\":{:.3},\
+\"counts_before\":{{\"events\":{},\"expert_events\":{},\"sessions\":{},\"passes\":{},\"routing\":{},\"perf\":{},\"hw\":{},\"status\":{},\"gaps\":{}}},\
+\"counts_after\":{{\"events\":{},\"expert_events\":{},\"sessions\":{},\"passes\":{},\"routing\":{},\"perf\":{},\"hw\":{},\"status\":{},\"gaps\":{}}},\
+\"db_bytes_before\":{},\"db_bytes_after\":{},\"integrity\":\"{}\",\"table_bytes_before\":{},\"table_bytes_after\":{}}}",
+            json::esc(&cfg.db), cfg.retention_days, cfg.event_line_hours, cfg.vacuum,
+            hw, stt, comp.lines_removed, comp.sessions, comp.sessions_skipped, comp.cutoff_ts,
+            before.events, before.expert_events, before.sessions, before.passes, before.routing,
+            before.perf, before.hw, before.status, before.gaps,
+            after.events, after.expert_events, after.sessions, after.passes, after.routing,
+            after.perf, after.hw, after.status, after.gaps,
+            before_b, after_b, json::esc(&integrity), tb(&before_tables), tb(&after_tables)
+        ));
+    }
+    println!("{{\"tool\":\"matrix-collect maintenance\",\"version\":\"{}\",{}}}", VERSION, parts.join(","));
+    let _ = std::io::stdout().flush();
+    process::exit(0);
+}
+
+// ------------------------------------------- Stage 7: labelled residency estimate
+fn residency_estimate(path: &str, slots: Option<i64>) -> String {
+    let raw = match std::fs::read(path) {
+        Ok(r) => r,
+        Err(e) => {
+            return format!(
+                ",\"status\":\"unavailable\",\"basis\":\"estimate\",\"confirmed\":false,\"reason\":\"expert profile unreadable ({}); no per-expert residency exists in the v1 stream, so nothing is painted\"",
+                json::esc(&format!("{e}"))
+            )
+        }
+    };
+    if raw.len() < 24 || &raw[0..4] != b"STRP" {
+        return ",\"status\":\"unavailable\",\"basis\":\"estimate\",\"confirmed\":false,\"reason\":\"expert profile has no STRP header; the estimate is not invented\"".into();
+    }
+    let u32at = |o: usize| -> u64 { u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]) as u64 };
+    let u16at = |o: usize| -> u64 { u16::from_le_bytes([raw[o], raw[o + 1]]) as u64 };
+    let version = u32at(4);
+    let layers = u32at(8);
+    let experts = u32at(12);
+    let ranked = u32at(20);
+    // The ranked list is `n_ranked` records of u16 layer + u16 expert (4 bytes
+    // each, hottest first); the file then carries a parallel array of u32
+    // counts (24 + 24576*4 + 24576*4 = 196632 bytes on the shipped profile).
+    // Same layout the legacy reader verified independently.
+    let pairs = ((raw.len() - 24) / 4) as u64;
+    let n = ranked.min(pairs);
+    let slots = match slots {
+        Some(s) if s > 0 => s as u64,
+        _ => {
+            return format!(
+                ",\"status\":\"unavailable\",\"basis\":\"estimate\",\"confirmed\":false,\"profile\":{{\"path\":\"{}\",\"version\":{},\"layers\":{},\"experts\":{},\"ranked\":{}}},\"reason\":\"the engine's /metrics did not report engine.expert_slots, so the VRAM/RAM boundary cannot be placed\"",
+                json::esc(path), version, layers, experts, n
+            )
+        }
+    };
+    let vram = slots.min(n);
+    let mut cells = String::with_capacity((vram as usize) * 7);
+    let mut counted = 0u64;
+    for i in 0..vram {
+        let o = 24 + (i as usize) * 4;
+        let l = u16at(o);
+        let e = u16at(o + 2);
+        if l >= layers || e >= experts {
+            continue;
+        }
+        if counted > 0 {
+            cells.push(',');
+        }
+        cells.push_str(&(l * experts + e).to_string());
+        counted += 1;
+    }
+    format!(
+        ",\"status\":\"estimate\",\"basis\":\"estimate\",\"confirmed\":false,\"label\":\"residency_estimate\",\
+\"source\":\"model structure: expert-profile.bin pairs ranked by routing frequency, prefix of length engine.expert_slots from the engine's own /metrics\",\
+\"policy\":\"static profile-ordered, no eviction\",\
+\"profile\":{{\"path\":\"{}\",\"version\":{},\"layers\":{},\"experts\":{},\"ranked\":{},\"pairs_read\":{}}},\
+\"slots\":{},\"slots_source\":\"engine /metrics engine.expert_slots (auto-sized per boot)\",\
+\"tiers\":{{\"vram\":{},\"ram\":{},\"ssd\":0}},\
+\"ssd_note\":\"no per-expert SSD residency exists: the pinned RAM arena holds the whole expert corpus at startup; residual SSD/page-cache reads are per-request counters (file_blobs/file_mb), not residency\",\
+\"index_base\":{},\"vram_cells\":[{}],\
+\"note\":\"ESTIMATE from model structure, never live truth: the engine emits no per-expert residency events and its cache never evicts; aggregate /metrics cache numbers are not per-expert and are not used here\"",
+        json::esc(path), version, layers, experts, n, pairs, slots, vram, n - vram, experts, cells
+    )
+}
+
 // --------------------------------------------------------------------- main
 fn main() {
     let cfg = match parse_args() {
@@ -1064,6 +1263,13 @@ fn main() {
             process::exit(2);
         }
     };
+
+    // ---- offline maintenance modes: no tailing, no socket, no writes to a
+    // live database (export is strictly read-only; prune is meant for fixtures
+    // or for a stopped collector)
+    if cfg.prune || cfg.export.is_some() {
+        run_maintenance(&cfg);
+    }
 
     // ---- replay mode: no tailing, no socket, just stored NDJSON
     if let Some(sess) = cfg.replay.clone() {
@@ -1123,10 +1329,18 @@ fn main() {
         match Store::open(&cfg.db) {
             Ok(mut s) => {
                 let (hw, stt) = s.prune(cfg.retention_days).unwrap_or((0, 0));
-                if hw + stt > 0 {
+                let mut comp = db::Compact::default();
+                if cfg.event_line_hours > 0.0 {
+                    match s.compact_event_lines(cfg.event_line_hours, false) {
+                        Ok(c) => comp = c,
+                        Err(e) => eprintln!("warning: event-line compaction failed: {e}"),
+                    }
+                }
+                if hw + stt + comp.lines_removed as usize > 0 {
                     println!(
-                        "{{\"log\":\"retention\",\"days\":{},\"hw_pruned\":{},\"status_pruned\":{}}}",
-                        cfg.retention_days, hw, stt
+                        "{{\"log\":\"retention\",\"days\":{},\"hw_pruned\":{},\"status_pruned\":{},\"routing_pruned\":0,\"event_line_hours\":{},\"event_lines_compacted\":{},\"sessions_compacted\":{},\"sessions_skipped\":{},\"db_bytes_before\":{},\"db_bytes_after\":{}}}",
+                        cfg.retention_days, hw, stt, cfg.event_line_hours, comp.lines_removed,
+                        comp.sessions, comp.sessions_skipped, comp.bytes_before, comp.bytes_after
                     );
                 }
                 Some(s)
@@ -1288,6 +1502,7 @@ fn main() {
         reg_rx,
         last_finished: None,
         meta_line: None,
+        res_line: None,
     };
 
     // Resume seq from storage so seq stays monotonic across restarts.
@@ -1352,6 +1567,27 @@ fn main() {
         cfg.retention_days
     );
     core.emit("meta", None, false, &body);
+
+    // ---- residency estimate: STRUCTURE, not truth.
+    // The engine exposes no per-expert residency: its cache pre-fills from a
+    // static profile and never evicts, and /metrics reports aggregate slot and
+    // byte counts only. What can be said honestly is derived from the model's
+    // own STRP profile (pairs ranked by routing frequency) plus the engine's
+    // own `expert_slots`: the first `slots` ranked pairs are the VRAM set, the
+    // rest live in the pinned RAM arena. That is model structure, so every
+    // field is labelled `estimate` and `confirmed:false`; the app must never
+    // paint it as live truth.
+    let slots = core
+        .metrics
+        .raw
+        .as_ref()
+        .and_then(|raw| json::parse(raw.as_bytes()).ok())
+        .and_then(|v| v.path(&["engine", "expert_slots"]).and_then(|x| x.as_i64()));
+    let res_body = residency_estimate(&cfg.expert_profile, slots);
+    core.emit("residency_estimate", None, false, &res_body);
+    println!("{{\"log\":\"residency_estimate\",\"status\":\"{}\"}}",
+        if res_body.contains("\"status\":\"estimate\"") { "estimate" } else { "unavailable" });
+    let _ = std::io::stdout().flush();
 
     // ---- restart / crash gap accounting
     if let Some((_, off, anchor)) = prev_cursor.clone() {

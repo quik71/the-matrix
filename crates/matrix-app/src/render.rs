@@ -43,6 +43,10 @@ const AMBER: [f32; 4] = [1.0, 0.74, 0.26, 1.0];
 const PANEL_BG: [f32; 4] = [0.012, 0.059, 0.031, 1.0];
 const PANEL_EDGE: [f32; 4] = [0.071, 0.227, 0.133, 1.0];
 const CELL_OFF: [f32; 4] = [0.090, 0.150, 0.120, 1.0];
+/// Residency ESTIMATE tint (VRAM-prefix cells). Deliberately a quiet shift of
+/// the inactive colour: it marks structure, never activation, and the panel
+/// legend and the dump both say `estimate`.
+const CELL_EST_VRAM: [f32; 4] = [0.150, 0.330, 0.245, 1.0];
 /// Panel background opacity (the legacy `bgOpacity` knob): the panels are opaque
 /// so the data stays legible; the ambient rain shows in the gutters instead.
 const PANEL_ALPHA: f32 = 1.0;
@@ -878,6 +882,10 @@ pub struct FrameStats {
     pub banner_quads: usize,
     pub visible_cells: usize,
     pub families: usize,
+    /// cells painted with the residency ESTIMATE tint (0 when no estimate)
+    pub res_cells: usize,
+    pub res_len: usize,
+    pub res_epoch_seen: u64,
 }
 
 pub struct Renderer {
@@ -915,6 +923,10 @@ pub struct Renderer {
     /// re-uploads them, so the lattice always sits inside its current panel.
     grid_key: (f32, f32, f32, f32, f32),
     n_cells: usize,
+    /// residency estimate bitmap, one byte per (layer, expert); empty = none
+    res: Vec<u8>,
+    res_epoch: u64,
+    res_cells: usize,
     n_lattice: usize,
     /// cells built after culling (zoom/pan can hide most of the lattice)
     visible: usize,
@@ -1202,6 +1214,9 @@ impl Renderer {
             dim: (N_LAYERS, N_EXPERTS),
             grid_key: (f32::NAN, 0.0, 0.0, 0.0, 0.0),
             n_cells: 0,
+            res: Vec::new(),
+            res_epoch: u64::MAX,
+            res_cells: 0,
             n_lattice: (N_EXPERTS + 1) + (N_LAYERS + 1),
             visible: 0,
         };
@@ -1220,13 +1235,29 @@ impl Renderer {
 
     /// Recompute the layout for the current CSS size, view and grid dimensions.
     pub fn relayout(&mut self, view: u8, layers: usize, experts: usize,
-                    zoom: f32, pan_x: f32, pan_y: f32) {
+                    zoom: f32, pan_x: f32, pan_y: f32,
+                    res: Option<&crate::state::Residency>, res_epoch: u64) {
         self.layout = Layout::compute(self.css.0, self.css.1, view, layers, experts, zoom, pan_x, pan_y);
         let g = self.layout.grid;
         let key = (g.x, g.y, g.w, g.h, self.layout.cell + self.layout.cell_h * 1000.0);
-        if self.dim != (layers, experts) || self.grid_key != key {
+        // The residency estimate arrives once, after the lattice exists: its
+        // epoch is part of the rebuild key so the tint appears without any
+        // per-frame bitmap copy.
+        let epoch = if res.map(|r| r.status == "estimate").unwrap_or(false) {
+            res_epoch.max(1)
+        } else {
+            0
+        };
+        if self.dim != (layers, experts) || self.grid_key != key || self.res_epoch != epoch {
             self.dim = (layers, experts);
             self.grid_key = key;
+            self.res_epoch = epoch;
+            self.res = match res {
+                Some(r) if r.status == "estimate" && r.cells.len() >= layers.saturating_mul(experts) => {
+                    r.cells.iter().map(|b| if *b { 1u8 } else { 0u8 }).collect()
+                }
+                _ => Vec::new(),
+            };
             self.rebuild_lattice();
         }
     }
@@ -1240,7 +1271,7 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
         self.css = (size.width as f32 / self.scale, size.height as f32 / self.scale);
         let (v, l, e) = (self.layout.view, self.dim.0, self.dim.1);
-        self.relayout(v, l, e, 1.0, 0.0, 0.0);
+        self.relayout(v, l, e, 1.0, 0.0, 0.0, None, 0);
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&Globals {
             res: [size.width as f32, size.height as f32],
             scale: self.scale,
@@ -1254,18 +1285,25 @@ impl Renderer {
     /// layers x experts from the collector's `meta` event.
     fn rebuild_lattice(&mut self) {
         let v = self.layout;
-        let (nl, _ne) = self.dim;
+        let (nl, ne) = self.dim;
         let (l0, l1, e0, e1) = v.vis;
         let mut cell_quads: Vec<Quad> = Vec::with_capacity((l1 - l0).saturating_mul(e1 - e0).max(1));
+        let mut painted = 0usize;
+        let use_res = !self.res.is_empty() && self.res.len() >= nl.saturating_mul(ne);
         for layer in l0..l1 {
             let y = v.grid.y + (nl - 1 - layer) as f32 * v.cell_h;
             for e in e0..e1 {
+                let tint = use_res && self.res[layer * ne + e] == 1;
+                if tint {
+                    painted += 1;
+                }
                 cell_quads.push(Quad {
                     rect: [v.grid.x + e as f32 * v.cell, y, v.cell, v.cell_h],
-                    color: CELL_OFF,
+                    color: if tint { CELL_EST_VRAM } else { CELL_OFF },
                 });
             }
         }
+        self.res_cells = painted;
         self.visible = cell_quads.len();
         let dev = &self.device;
         let q = &self.queue;
@@ -1781,6 +1819,9 @@ impl Renderer {
             banner_quads,
             visible_cells: self.visible,
             families: rain_eng.families_live(),
+            res_cells: self.res_cells,
+            res_len: self.res.len(),
+            res_epoch_seen: self.res_epoch,
         }
     }
 
@@ -2341,7 +2382,7 @@ impl Renderer {
         // honest unavailable block
         let uy = r.bottom() - 84.0;
         self.push_text(tb, SZ_MICRO, x, uy, "unavailable in the v1 stream (never invented):", FAINT, max_x);
-        self.push_text(tb, SZ_MICRO, x, uy + 14.0, "· EXPERT RESIDENCY (VRAM/RAM/SSD) — no residency events", FAINT, max_x);
+        self.push_text(tb, SZ_MICRO, x, uy + 14.0, "· RESIDENCY TRUTH — none; lattice tint is a profile ESTIMATE", FAINT, max_x);
         self.push_text(tb, SZ_MICRO, x, uy + 27.0, "· ROUTING SCORES — serve-path weights are all 0.0", FAINT, max_x);
         self.push_text(tb, SZ_MICRO, x, uy + 40.0, "· TOKEN TEXT — pass_index only, no decoded tokens", FAINT, max_x);
         self.push_text(tb, SZ_MICRO, x, uy + 53.0, "· HISTORY REPLAY — Stage 7 (trails + view 6 are live)", FAINT, max_x);
@@ -2576,7 +2617,7 @@ impl Renderer {
                 self.row(tb, x, max_x, "gpu", "unavailable — no hw_sample", AMBER, &mut y, 17.0);
             }
         }
-        self.push_text(tb, SZ_MICRO, x, r.bottom() - 40.0, "aggregate memory only — per-expert residency", FAINT, max_x);
+        self.push_text(tb, SZ_MICRO, x, r.bottom() - 40.0, "aggregate only — per-expert residency is an estimate", FAINT, max_x);
         self.push_text(tb, SZ_MICRO, x, r.bottom() - 27.0, "is not in the v1 stream, so it is not drawn", FAINT, max_x);
         self.push_text(tb, SZ_MICRO, x, r.bottom() - 14.0, "NVMe/SSD metrics: unavailable", FAINT, max_x);
     }

@@ -671,9 +671,17 @@ impl ApplicationHandler<()> for App {
                 }
                 self.resize_pending = false;
                 self.msgs_since_draw = 0;
+                {
+                    // Stage 7 soak metric: presented-frame interval. Bucketed in
+                    // the app (cumulative histogram) so the sampler can diff two
+                    // dumps and get that interval's exact p95.
+                    let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+                    st.record_frame_ms(dt);
+                }
                 if let (Some(g), Some(_w)) = (self.gpu.as_mut(), self.window.as_ref()) {
                     let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
-                    g.relayout(st.view, st.layers, st.experts, st.zoom, st.pan_x, st.pan_y);
+                    g.relayout(st.view, st.layers, st.experts, st.zoom, st.pan_x, st.pan_y,
+                               st.residency.as_ref(), st.res_epoch);
                     // record the geometry the renderer actually used, so the dump
                     // reports the viewport instead of the request
                     let gr = g.layout.grid;
