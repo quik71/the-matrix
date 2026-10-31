@@ -277,8 +277,13 @@ def test_a5():
     t["profile_check"] = prof
     t["profile_pairs"], t["profile_layers"], t["profile_experts"] = (
         (prof.split() + ["", "", ""])[:3] if prof else ("", "", ""))
-    a = load("analysis.json") if exists("analysis.json") else {}
-    painted = [s.get("residency_painted") for s in (a or {}).get("samples") or [] if s.get("residency_painted")]
+    # analysis.json carries the sample COUNT, not the samples; the per-sample
+    # residency the app painted lives in soak.json (falling back to samples.jsonl)
+    samp = (load("soak.json") or {}).get("samples") or []
+    if not samp and exists("samples.jsonl"):
+        samp = [json.loads(line) for line in open(os.path.join(ART, "samples.jsonl")) if line.strip()]
+    painted = [s.get("residency_painted") for s in samp if s.get("residency_painted")]
+    t["app_painted_samples"] = len(painted)
     t["app_painted_cells"] = painted[-1] if painted else None
     t["app_labels"] = out(f"grep -c 'ESTIMATE from model structure' {R}/logs/s7soak-app.log 2>/dev/null || true")
     ok = (t["event_type"] == "residency_estimate" and t["status"] == "estimate"
