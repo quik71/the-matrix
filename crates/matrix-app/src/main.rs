@@ -31,7 +31,8 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 use client::Msg;
-use render::{Overlay, Rain, Renderer, VIEW_ACTIVATION, VIEW_OVERVIEW, VIEW_PERF, VIEW_SESSIONS, VIEW_STREAM};
+use render::{Overlay, Rain, Renderer, VIEW_ACTIVATION, VIEW_COACT, VIEW_OVERVIEW, VIEW_PERF,
+             VIEW_SESSIONS, VIEW_STREAM};
 use state::State;
 
 pub fn now_unix() -> f64 {
@@ -69,6 +70,21 @@ struct Args {
     /// monitor Hyprland had focused when the app started.
     monitor: String,
     view: u8,
+    // ---- Stage 6
+    banner: bool,
+    banner_interval: f64,
+    motion_reduced: bool,
+    trails: bool,
+    rain_density: f32,
+    rain_speed: f32,
+    glow: f32,
+    zoom: f32,
+    pan_x: f32,
+    pan_y: f32,
+    /// Labelled INPUT SELF-TEST hook: a control file whose lines inject the same
+    /// commands the keyboard does (zoom/pan/view/trails). It changes UI state
+    /// only — it cannot create telemetry.
+    ctl: Option<String>,
 }
 
 fn parse_view(s: &str) -> u8 {
@@ -78,6 +94,7 @@ fn parse_view(s: &str) -> u8 {
         "3" | "sessions" => VIEW_SESSIONS,
         "4" | "perf" => VIEW_PERF,
         "5" | "stream" => VIEW_STREAM,
+        "6" | "coact" | "co-activation" => VIEW_COACT,
         _ => VIEW_OVERVIEW,
     }
 }
@@ -95,6 +112,17 @@ fn parse_args() -> Args {
         meta_db: None,
         monitor: "active".into(),
         view: VIEW_OVERVIEW,
+        banner: true,
+        banner_interval: 26.0,
+        motion_reduced: false,
+        trails: true,
+        rain_density: 0.55,
+        rain_speed: 1.0,
+        glow: 0.60,
+        zoom: 1.0,
+        pan_x: 0.0,
+        pan_y: 0.0,
+        ctl: None,
     };
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -141,6 +169,54 @@ fn parse_args() -> Args {
                 a.view = parse_view(&need(i));
                 i += 2;
             }
+            "--banner" => {
+                a.banner = need(i) != "off";
+                i += 2;
+            }
+            "--banner-interval" => {
+                let v: f64 = need(i).parse().unwrap_or(26.0);
+                a.banner_interval = v.clamp(4.0, 600.0);
+                i += 2;
+            }
+            "--motion" => {
+                a.motion_reduced = need(i) == "reduced";
+                i += 2;
+            }
+            "--trails" => {
+                a.trails = need(i) != "off";
+                i += 2;
+            }
+            "--rain-density" => {
+                let v: f32 = need(i).parse().unwrap_or(0.55);
+                a.rain_density = v.clamp(0.05, 1.0);
+                i += 2;
+            }
+            "--rain-speed" => {
+                let v: f32 = need(i).parse().unwrap_or(1.0);
+                a.rain_speed = v.clamp(0.2, 3.0);
+                i += 2;
+            }
+            "--glow" => {
+                let v: f32 = need(i).parse().unwrap_or(0.6);
+                a.glow = v.clamp(0.0, 1.0);
+                i += 2;
+            }
+            "--zoom" => {
+                a.zoom = need(i).parse().unwrap_or(1.0);
+                i += 2;
+            }
+            "--pan-x" => {
+                a.pan_x = need(i).parse().unwrap_or(0.0);
+                i += 2;
+            }
+            "--pan-y" => {
+                a.pan_y = need(i).parse().unwrap_or(0.0);
+                i += 2;
+            }
+            "--ctl" => {
+                a.ctl = Some(need(i));
+                i += 2;
+            }
             "--wm-fullscreen" => {
                 a.wm_fullscreen = need(i) != "off";
                 i += 2;
@@ -155,11 +231,24 @@ fn parse_args() -> Args {
                      --rain <on|off>        Matrix rain animation (on)\n\
                      --width/--height <n>   initial window size (1600x900); the WM makes it fullscreen\n\
                      --monitor <name|active> place the window on this Hyprland monitor (default: the focused one)\n\
-                     --view <1..5|name>     overview | activation | sessions | perf | stream (default overview)\n\
+                     --view <1..6|name>     overview | activation | sessions | perf | stream | coact\n\
                      --wm-fullscreen <on|off> ask Hyprland for WM-fullscreen on the target monitor (on)\n\
                      --meta-db <sqlite>     fallback: read the collector's recorded meta row when the socket\n\
                                            never delivered one (labelled 'collector store' in the UI)\n\
-                     keys: esc quit · r rain · f fullscreen · 1-5 views · j/k or up/down select layer"
+                     --banner <on|off>      FOLLOW THE WHITE RABBIT banner (on; obeys the ambient gate)\n\
+                     --banner-interval <s>  banner repeat interval in seconds (26)\n\
+                     --motion <full|reduced> reduced disables rain, banner, bursts and pulses\n\
+                     --trails <on|off>      historical trail bars on the lattice (on)\n\
+                     --rain-density <f>     rain density 0.05..1.0 (0.55)\n\
+                     --rain-speed <f>       rain speed multiplier 0.2..3.0 (1.0)\n\
+                     --glow <f>             activation bloom intensity 0..1 (0.6)\n\
+                     --zoom <f>             initial lattice zoom 0.5..12 (1.0)\n\
+                     --pan-x/--pan-y <px>   initial lattice pan in CSS px (0)\n\
+                     --ctl <path>           INPUT SELF-TEST hook: a control file whose lines inject the\n\
+                                            same commands the keyboard does (zoom/pan/view/trails);\n\
+                                            UI state only, it cannot create telemetry\n\
+                     keys: esc quit · r rain · f fullscreen · 1-6 views · j/k layer · +/- zoom ·\n\
+                           w/a/s/d pan · 0 reset · t trails · b banner"
                 );
                 std::process::exit(0);
             }
@@ -205,6 +294,8 @@ struct App {
     /// a redraw was requested because a displayed value changed
     req_change: bool,
     last_groups: Vec<(&'static str, u64)>,
+    /// the decorative banner is on screen right now (its own animation clock)
+    banner_anim: bool,
 }
 
 impl App {
@@ -268,7 +359,7 @@ impl App {
             let st = self.st.lock().unwrap_or_else(|p| p.into_inner());
             st.fingerprint()
         };
-        let anim = self.overlay.animating(self.elapsed_ms());
+        let anim = self.overlay.animating(self.elapsed_ms()) || self.banner_anim;
         if fp != self.last_fp || anim {
             true
         } else {
@@ -291,6 +382,16 @@ impl App {
             }
             w.request_redraw();
         }
+    }
+
+    /// Advance the decorative banner clock and report whether it is visible.
+    /// The ambient gate is the same one the rain obeys, so `--rain off` (the
+    /// strict idle measurement) silences the banner as well.
+    fn step_banner(&mut self, now: f64) -> bool {
+        let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+        let ambient = st.rain && !st.motion_reduced;
+        let on = st.banner.step(now, ambient);
+        on
     }
 
     fn spawn_client(&mut self, proxy: EventLoopProxy<()>) {
@@ -339,6 +440,18 @@ impl ApplicationHandler<()> for App {
             let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
             st.rain = self.args.rain;
             st.view = self.args.view;
+            st.set_zoom(self.args.zoom);
+            st.pan_x = self.args.pan_x;
+            st.pan_y = self.args.pan_y;
+            st.trails = self.args.trails;
+            st.motion_reduced = self.args.motion_reduced;
+            st.rain_density = self.args.rain_density;
+            st.rain_speed = self.args.rain_speed;
+            st.glow = self.args.glow;
+            st.banner = state::Banner::new(self.args.banner, self.args.banner_interval);
+            if st.motion_reduced {
+                st.rain = false;
+            }
         }
         self.rain = Rain::new(size.width as f32, size.height as f32);
         self.t0 = Instant::now();
@@ -419,6 +532,67 @@ impl ApplicationHandler<()> for App {
                             drop(st);
                             dirty = true;
                         }
+                        Key::Character(ref c) if c == "+" || c == "=" => {
+                            let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+                            st.zoom_by(1.25);
+                            drop(st);
+                            dirty = true;
+                        }
+                        Key::Character(ref c) if c == "-" || c == "_" => {
+                            let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+                            st.zoom_by(0.8);
+                            drop(st);
+                            dirty = true;
+                        }
+                        Key::Character(ref c) if c == "0" => {
+                            let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+                            st.reset_view();
+                            drop(st);
+                            dirty = true;
+                        }
+                        Key::Character(ref c) if c.eq_ignore_ascii_case("w") => {
+                            let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+                            st.pan_by(0.0, -80.0);
+                            drop(st);
+                            dirty = true;
+                        }
+                        Key::Character(ref c) if c.eq_ignore_ascii_case("s") => {
+                            let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+                            st.pan_by(0.0, 80.0);
+                            drop(st);
+                            dirty = true;
+                        }
+                        Key::Character(ref c) if c.eq_ignore_ascii_case("a") => {
+                            let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+                            st.pan_by(-80.0, 0.0);
+                            drop(st);
+                            dirty = true;
+                        }
+                        Key::Character(ref c) if c.eq_ignore_ascii_case("d") => {
+                            let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+                            st.pan_by(80.0, 0.0);
+                            drop(st);
+                            dirty = true;
+                        }
+                        Key::Character(ref c) if c.eq_ignore_ascii_case("t") => {
+                            let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+                            st.trails = !st.trails;
+                            drop(st);
+                            dirty = true;
+                        }
+                        Key::Character(ref c) if c.eq_ignore_ascii_case("b") => {
+                            let now = self.elapsed_ms();
+                            let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+                            st.banner.trigger(now);
+                            drop(st);
+                            dirty = true;
+                        }
+                        Key::Character(ref c) if c.eq_ignore_ascii_case("c") => {
+                            let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+                            st.view = VIEW_COACT;
+                            drop(st);
+                            dirty = true;
+                        }
                         Key::Character(ref c) => {
                             let cs = c.to_string();
                             let v = match cs.as_str() {
@@ -427,6 +601,7 @@ impl ApplicationHandler<()> for App {
                                 "3" => Some(VIEW_SESSIONS),
                                 "4" => Some(VIEW_PERF),
                                 "5" => Some(VIEW_STREAM),
+                                "6" => Some(VIEW_COACT),
                                 _ => None,
                             };
                             if let Some(v) = v {
@@ -456,7 +631,8 @@ impl ApplicationHandler<()> for App {
                     let st = self.st.lock().unwrap_or_else(|p| p.into_inner());
                     st.fingerprint()
                 };
-                let animating = self.overlay.animating(now);
+                let banner_on = self.step_banner(now);
+                let animating = self.overlay.animating(now) || banner_on;
                 let rain_on = self.st.lock().unwrap_or_else(|p| p.into_inner()).rain;
                 let in_anim_grace = Instant::now() < self.anim_until || self.req_anim;
                 self.req_anim = false;
@@ -497,7 +673,14 @@ impl ApplicationHandler<()> for App {
                 self.msgs_since_draw = 0;
                 if let (Some(g), Some(_w)) = (self.gpu.as_mut(), self.window.as_ref()) {
                     let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
-                    g.relayout(st.view, st.layers, st.experts);
+                    g.relayout(st.view, st.layers, st.experts, st.zoom, st.pan_x, st.pan_y);
+                    // record the geometry the renderer actually used, so the dump
+                    // reports the viewport instead of the request
+                    let gr = g.layout.grid;
+                    st.view_rect = (gr.x, gr.y, gr.w, gr.h);
+                    st.view_cell = g.layout.cell;
+                    st.view_cell_h = g.layout.cell_h;
+                    st.visible_cells = g.visible_cells();
                     self.overlay.decay(dt);
                     let fs = g.draw(&st, &self.overlay, &mut self.rain, now, dt);
                     self.frames += 1;
@@ -523,12 +706,13 @@ impl ApplicationHandler<()> for App {
             return;
         }
         let now = self.elapsed_ms();
+        let banner_on = self.step_banner(now);
         let rain = self.st.lock().unwrap_or_else(|p| p.into_inner()).rain;
         // Present-on-demand with a 60 fps budget: animate only while the rain is
         // on or a lamp is still decaying, and never faster than one frame per
         // 16 ms. With no animation and no events the loop blocks in Wait with no
         // timer at all — zero redraws, zero wake-ups.
-        if rain || self.overlay.animating(now) {
+        if rain || banner_on || self.overlay.animating(now) {
             let now_i = Instant::now();
             if now_i >= self.next_frame {
                 self.next_frame = now_i + Duration::from_millis(16);
@@ -794,6 +978,120 @@ fn meta_backfill(db: String, st: Arc<Mutex<State>>) {
     }
 }
 
+/// INPUT SELF-TEST: apply one control-file line to the UI state. This is the
+/// same set of operations the keyboard handlers perform (zoom, pan, view,
+/// trails, layer, rain, banner) and nothing else — it cannot inject telemetry,
+/// create activations, or move data. The app labels every dump with
+/// `input_selftest` so no reader can mistake it for real input.
+fn apply_command(cmd: &str, st: &mut State, now_ms: f64) -> Result<String, String> {
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    match parts.as_slice() {
+        ["zoom", z] => {
+            let v: f32 = z.parse().map_err(|_| format!("bad zoom {z:?}"))?;
+            st.set_zoom(v);
+            Ok(format!("zoom {:.3}", st.zoom))
+        }
+        ["pan", x, y] => {
+            let dx: f32 = x.parse().map_err(|_| format!("bad pan x {x:?}"))?;
+            let dy: f32 = y.parse().map_err(|_| format!("bad pan y {y:?}"))?;
+            st.pan_by(dx, dy);
+            Ok(format!("pan {:+.1},{:+.1}", st.pan_x, st.pan_y))
+        }
+        ["view", v] => {
+            st.view = parse_view(v);
+            Ok(format!("view {}", st.view))
+        }
+        ["rain", s] => {
+            st.rain = *s != "off";
+            Ok(format!("rain {}", if st.rain { "on" } else { "off" }))
+        }
+        ["trails", s] => {
+            st.trails = *s != "off";
+            Ok(format!("trails {}", st.trails))
+        }
+        ["layer", l] => {
+            let v: usize = l.parse().map_err(|_| format!("bad layer {l:?}"))?;
+            st.sel_layer = v.min(st.layers.saturating_sub(1));
+            st.sel_pinned = true;
+            Ok(format!("layer {}", st.sel_layer))
+        }
+        ["banner"] => {
+            st.banner.trigger(now_ms);
+            Ok(format!("banner cycle {}", st.banner.cycles))
+        }
+        ["reset"] => {
+            st.reset_view();
+            Ok("reset view".into())
+        }
+        ["motion", s] => {
+            st.motion_reduced = *s == "reduced";
+            if st.motion_reduced {
+                st.rain = false;
+            }
+            Ok(format!("motion {}", if st.motion_reduced { "reduced" } else { "full" }))
+        }
+        [] => Err("empty command".into()),
+        _ => Err(format!("unknown command {cmd:?}")),
+    }
+}
+
+/// Watch the labelled control file and inject its commands as user events.
+fn ctl_watch(path: String, st: Arc<Mutex<State>>, proxy: EventLoopProxy<()>) {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut off: u64 = 0;
+    loop {
+        if STOP.load(Ordering::SeqCst) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(60));
+        let len = match std::fs::metadata(&path) {
+            Ok(m) => m.len(),
+            Err(_) => continue,
+        };
+        if len < off {
+            off = 0;
+        }
+        if len == off {
+            continue;
+        }
+        let mut f = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        if f.seek(SeekFrom::Start(off)).is_err() {
+            continue;
+        }
+        let mut buf = String::new();
+        if f.read_to_string(&mut buf).is_err() {
+            continue;
+        }
+        off = len;
+        for line in buf.lines() {
+            let cmd = line.trim();
+            if cmd.is_empty() || cmd.starts_with('#') {
+                continue;
+            }
+            let res = {
+                let mut s = st.lock().unwrap_or_else(|p| p.into_inner());
+                let now_ms = (crate::now_unix() - s.started_wall) * 1000.0;
+                let r = apply_command(cmd, &mut s, now_ms);
+                s.selftest_commands += 1;
+                s.selftest_last = cmd.to_string();
+                s.selftest_last_ts = crate::now_unix();
+                if r.is_err() {
+                    s.selftest_errors += 1;
+                }
+                r
+            };
+            match res {
+                Ok(m) => eprintln!("ctl: INPUT SELF-TEST {cmd:?} -> {m}"),
+                Err(e) => eprintln!("ctl: INPUT SELF-TEST {cmd:?} rejected: {e}"),
+            }
+            let _ = proxy.send_event(());
+        }
+    }
+}
+
 fn main() {
     let args = parse_args();
     unsafe {
@@ -863,10 +1161,25 @@ fn main() {
         req_anim: false,
         req_change: false,
         last_groups: Vec::new(),
+        banner_anim: false,
         args,
     };
     let proxy = event_loop.create_proxy();
     app.spawn_client(proxy.clone());
+    if let Some(path) = app.args.ctl.clone() {
+        if std::fs::File::open(&path).is_err() {
+            let _ = std::fs::write(&path, "");
+        }
+        {
+            let mut s = app.st.lock().unwrap_or_else(|p| p.into_inner());
+            s.selftest_enabled = true;
+            s.selftest_source = path.clone();
+        }
+        let st2 = app.st.clone();
+        let p = proxy.clone();
+        eprintln!("ctrl: INPUT SELF-TEST hook armed on {path}");
+        std::thread::spawn(move || ctl_watch(path, st2, p));
+    }
     // The event loop blocks in ControlFlow::Wait when nothing is animating, so a
     // signal alone cannot wake it. A 150 ms watcher turns STOP into one user
     // event, which lets about_to_wait() exit cleanly — no periodic redraws.

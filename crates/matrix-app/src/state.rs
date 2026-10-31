@@ -18,6 +18,78 @@ pub const MAX_SESSIONS: usize = 512;
 pub const PERF_HIST: usize = 240;
 pub const MAX_GAPS: usize = 24;
 pub const HOT_N: usize = 10;
+pub const MIN_ZOOM: f32 = 0.5;
+pub const MAX_ZOOM: f32 = 12.0;
+
+/// Banner phases, in the order the spec describes them: the phrase reveals from
+/// left to right (cycling glyphs first), holds, then dissolves back into the
+/// rain. Decorative only — no telemetry drives it.
+pub const BANNER_REVEAL_MS: f64 = 1700.0;
+pub const BANNER_HOLD_MS: f64 = 2600.0;
+pub const BANNER_DISSOLVE_MS: f64 = 1300.0;
+
+#[derive(Clone, Copy)]
+pub struct Banner {
+    pub enabled: bool,
+    pub interval_s: f64,
+    pub t0_ms: f64,
+    pub cycles: u64,
+    pub phase: u8,
+    pub progress: f64,
+}
+
+impl Banner {
+    pub fn new(enabled: bool, interval_s: f64) -> Banner {
+        Banner { enabled, interval_s: interval_s.max(4.0), t0_ms: f64::NEG_INFINITY,
+                 cycles: 0, phase: 0, progress: 0.0 }
+    }
+
+    pub fn phase_name(&self) -> &'static str {
+        match self.phase {
+            1 => "reveal",
+            2 => "hold",
+            3 => "dissolve",
+            _ => "gap",
+        }
+    }
+
+    /// Advance the decorative clock. `ambient` is the app's animation gate (the
+    /// same one the rain obeys), so `--rain off` silences the banner too and the
+    /// strict idle measurement stays at zero frames. Returns true while a
+    /// visible banner is on screen.
+    pub fn step(&mut self, now: f64, ambient: bool) -> bool {
+        if !self.enabled || !ambient {
+            self.phase = 0;
+            self.progress = 0.0;
+            return false;
+        }
+        let span = BANNER_REVEAL_MS + BANNER_HOLD_MS + BANNER_DISSOLVE_MS;
+        if now - self.t0_ms >= self.interval_s * 1000.0 {
+            self.t0_ms = now;
+            self.cycles += 1;
+        }
+        let age = (now - self.t0_ms).max(0.0);
+        if age < BANNER_REVEAL_MS {
+            self.phase = 1;
+            self.progress = age / BANNER_REVEAL_MS;
+        } else if age < BANNER_REVEAL_MS + BANNER_HOLD_MS {
+            self.phase = 2;
+            self.progress = (age - BANNER_REVEAL_MS) / BANNER_HOLD_MS;
+        } else if age < span {
+            self.phase = 3;
+            self.progress = (age - BANNER_REVEAL_MS - BANNER_HOLD_MS) / BANNER_DISSOLVE_MS;
+        } else {
+            self.phase = 0;
+            self.progress = 0.0;
+        }
+        self.phase != 0
+    }
+
+    pub fn trigger(&mut self, now: f64) {
+        self.t0_ms = now;
+        self.cycles += 1;
+    }
+}
 
 #[derive(Clone)]
 pub struct Session {
@@ -262,6 +334,50 @@ pub struct State {
     pub layer_counts: Vec<u64>,
     pub expert_counts: Vec<u64>,
 
+    // ---- Stage 6: per-cell history (real event timestamps), co-activation pairs
+    //
+    // `cell_counts` / `cell_*_ts` are allocated on the first routing record: the
+    // trails view is a view over real expert_selected events (count + the wall
+    // timestamp the collector stamped on the event), never a decayed decoration
+    // standing in for data.
+    cell_counts: Vec<u32>,
+    cell_first_ts: Vec<f64>,
+    cell_last_ts: Vec<f64>,
+    /// co-activation counts, expert-major: pairs[a * EXPERT_SLOTS + b], a < b,
+    /// incremented once per top-k SET (one expert_selected event carries the
+    /// whole set for that layer/position, so the pair is a real co-selection).
+    pairs: Vec<u32>,
+    pub pairs_records: u64,
+    pub bursts_total: u64,
+    pub pulses_total: u64,
+
+    // ---- Stage 6: theme / interaction settings and their state
+    pub zoom: f32,
+    pub pan_x: f32,
+    pub pan_y: f32,
+    pub trails: bool,
+    pub motion_reduced: bool,
+    pub rain_density: f32,
+    pub rain_speed: f32,
+    pub glow: f32,
+    pub banner: Banner,
+    /// lattice rect as actually laid out (view, zoom, pan) — written by the
+    /// event loop right after relayout so the dump reports geometry the renderer
+    /// really used, not a request.
+    pub view_rect: (f32, f32, f32, f32),
+    pub view_cell: f32,
+    pub view_cell_h: f32,
+    pub visible_cells: usize,
+    /// Input-injection self-test hook (acceptance harness only). Labelled as an
+    /// input self-test everywhere it appears: it drives UI state, it never
+    /// fabricates telemetry.
+    pub selftest_enabled: bool,
+    pub selftest_source: String,
+    pub selftest_commands: u64,
+    pub selftest_errors: u64,
+    pub selftest_last: String,
+    pub selftest_last_ts: f64,
+
     // view / selection (Stage 5 panels)
     pub view: u8,
     pub sel_layer: usize,
@@ -344,6 +460,32 @@ impl State {
             status: None,
             layer_counts: vec![0; LAYER_SLOTS],
             expert_counts: vec![0; EXPERT_SLOTS],
+            cell_counts: Vec::new(),
+            cell_first_ts: Vec::new(),
+            cell_last_ts: Vec::new(),
+            pairs: Vec::new(),
+            pairs_records: 0,
+            bursts_total: 0,
+            pulses_total: 0,
+            zoom: 1.0,
+            pan_x: 0.0,
+            pan_y: 0.0,
+            trails: true,
+            motion_reduced: false,
+            rain_density: 0.55,
+            rain_speed: 1.0,
+            glow: 0.6,
+            banner: Banner::new(true, 26.0),
+            view_rect: (0.0, 0.0, 0.0, 0.0),
+            view_cell: 0.0,
+            view_cell_h: 0.0,
+            visible_cells: 0,
+            selftest_enabled: false,
+            selftest_source: String::new(),
+            selftest_commands: 0,
+            selftest_errors: 0,
+            selftest_last: String::new(),
+            selftest_last_ts: 0.0,
             view: 0,
             sel_layer: 0,
             sel_pinned: false,
@@ -437,6 +579,14 @@ impl State {
         self.placement.h.hash(&mut h);
         self.layer_counts.hash(&mut h);
         self.expert_counts.hash(&mut h);
+        self.zoom.to_bits().hash(&mut h);
+        self.pan_x.to_bits().hash(&mut h);
+        self.pan_y.to_bits().hash(&mut h);
+        self.trails.hash(&mut h);
+        self.motion_reduced.hash(&mut h);
+        self.rain_density.to_bits().hash(&mut h);
+        self.rain_speed.to_bits().hash(&mut h);
+        self.banner.enabled.hash(&mut h);
         self.sessions.len().hash(&mut h);
         for s in self.sessions.iter().rev().take(24) {
             s.id.hash(&mut h);
@@ -549,8 +699,98 @@ impl State {
             ("hw", h(&|d| { self.hw.as_ref().map(|x| (x.util_pct.map(|v| v.to_bits()), x.mem_used_mib.map(|v| v.to_bits()), x.load1.map(|v| v.to_bits()), x.temp_c.map(|v| v.to_bits()))).hash(d); })),
             ("status", h(&|d| { self.status.as_ref().map(|x| (x.events_per_s.to_bits(), x.records_per_s.to_bits(), x.drops_total, x.sub_sent, x.sub_depth, x.unattributed_requests, x.engine_requests_total)).hash(d); })),
             ("counts", h(&|d| { self.layer_counts.hash(d); self.expert_counts.hash(d); })),
-            ("ui", h(&|d| { self.view.hash(d); self.sel_layer.hash(d); self.rain.hash(d); self.placement.monitor.hash(d); self.placement.verified.hash(d); self.placement.w.hash(d); self.placement.h.hash(d); })),
+            ("ui", h(&|d| { self.view.hash(d); self.sel_layer.hash(d); self.rain.hash(d); self.placement.monitor.hash(d); self.placement.verified.hash(d); self.placement.w.hash(d); self.placement.h.hash(d); self.zoom.to_bits().hash(d); self.pan_x.to_bits().hash(d); self.pan_y.to_bits().hash(d); self.trails.hash(d); })),
         ]
+    }
+
+    /// Clamped zoom setter; the viewport is bounded so the lattice can never be
+    /// scrolled into an empty region by an out-of-range self-test command.
+    pub fn set_zoom(&mut self, z: f32) {
+        self.zoom = z.clamp(MIN_ZOOM, MAX_ZOOM);
+    }
+
+    pub fn zoom_by(&mut self, f: f32) {
+        self.set_zoom(self.zoom * f);
+    }
+
+    pub fn pan_by(&mut self, dx: f32, dy: f32) {
+        self.pan_x = (self.pan_x + dx).clamp(-8000.0, 8000.0);
+        self.pan_y = (self.pan_y + dy).clamp(-8000.0, 8000.0);
+    }
+
+    pub fn reset_view(&mut self) {
+        self.zoom = 1.0;
+        self.pan_x = 0.0;
+        self.pan_y = 0.0;
+    }
+
+    /// (selection count, last event timestamp) for one lattice cell — 0 / 0.0
+    /// when the app has not seen that cell activated.
+    pub fn cell(&self, layer: usize, expert: usize) -> (u32, f64) {
+        let idx = layer * EXPERT_SLOTS + expert;
+        (
+            self.cell_counts.get(idx).copied().unwrap_or(0),
+            self.cell_last_ts.get(idx).copied().unwrap_or(0.0),
+        )
+    }
+
+    pub fn cells_with_history(&self) -> usize {
+        self.cell_counts.iter().filter(|c| **c > 0).count()
+    }
+
+    pub fn history_totals(&self) -> (u64, f64, f64) {
+        let total: u64 = self.cell_counts.iter().map(|c| *c as u64).sum();
+        let mut first = 0.0f64;
+        let mut last = 0.0f64;
+        for (i, c) in self.cell_counts.iter().enumerate() {
+            if *c == 0 {
+                continue;
+            }
+            let f = self.cell_first_ts.get(i).copied().unwrap_or(0.0);
+            let l = self.cell_last_ts.get(i).copied().unwrap_or(0.0);
+            if f > 0.0 && (first == 0.0 || f < first) {
+                first = f;
+            }
+            if l > last {
+                last = l;
+            }
+        }
+        (total, first, last)
+    }
+
+    /// Co-selection count for one expert pair (order-independent).
+    pub fn pair(&self, a: usize, b: usize) -> u32 {
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        self.pairs.get(lo * EXPERT_SLOTS + hi).copied().unwrap_or(0)
+    }
+
+    pub fn pairs_distinct(&self) -> usize {
+        self.pairs.iter().filter(|c| **c > 0).count()
+    }
+
+    pub fn pairs_total(&self) -> u64 {
+        self.pairs.iter().map(|c| *c as u64).sum()
+    }
+
+    /// The heaviest co-selected expert pairs (a < b), highest first.
+    pub fn top_pairs(&self, n: usize) -> Vec<(u16, u16, u32)> {
+        let mut best: Vec<(u16, u16, u32)> = Vec::with_capacity(n + 1);
+        for a in 0..EXPERT_SLOTS {
+            let base = a * EXPERT_SLOTS;
+            for b in (a + 1)..EXPERT_SLOTS {
+                let c = self.pairs.get(base + b).copied().unwrap_or(0);
+                if c == 0 {
+                    continue;
+                }
+                if best.len() == n && c <= best[n - 1].2 {
+                    continue;
+                }
+                let pos = best.iter().position(|e| c > e.2).unwrap_or(best.len());
+                best.insert(pos, (a as u16, b as u16, c));
+                best.truncate(n);
+            }
+        }
+        best
     }
 
     pub fn hot_experts(&self, n: usize) -> Vec<(usize, u64)> {
@@ -770,6 +1010,47 @@ impl State {
                     self.last_active_layer = Some(layer as usize);
                     if !self.sel_pinned {
                         self.sel_layer = layer as usize;
+                    }
+                    // ---- Stage 6: per-cell history, from the event's own ts
+                    if ids.is_empty() {
+                        // nothing selected in the record: no history to add
+                    } else {
+                        let n = LAYER_SLOTS * EXPERT_SLOTS;
+                        if self.cell_counts.len() != n {
+                            self.cell_counts = vec![0; n];
+                            self.cell_first_ts = vec![0.0; n];
+                            self.cell_last_ts = vec![0.0; n];
+                        }
+                        let base = layer as usize * EXPERT_SLOTS;
+                        for x in ids.iter() {
+                            let idx = base + *x as usize;
+                            self.cell_counts[idx] = self.cell_counts[idx].saturating_add(1);
+                            if self.cell_first_ts[idx] <= 0.0 {
+                                self.cell_first_ts[idx] = ts;
+                            }
+                            self.cell_last_ts[idx] = ts;
+                        }
+                        // ---- co-activation: every pair inside this record's
+                        // top-k set. One event = one routing decision for one
+                        // layer and position, so the pair co-occurred for real.
+                        if ids.len() > 1 {
+                            if self.pairs.len() != EXPERT_SLOTS * EXPERT_SLOTS {
+                                self.pairs = vec![0u32; EXPERT_SLOTS * EXPERT_SLOTS];
+                            }
+                            for i in 0..ids.len() {
+                                for j in (i + 1)..ids.len() {
+                                    let (a, b) = (ids[i] as usize, ids[j] as usize);
+                                    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+                                    let k = lo * EXPERT_SLOTS + hi;
+                                    self.pairs[k] = self.pairs[k].saturating_add(1);
+                                }
+                            }
+                            self.pairs_records += 1;
+                        }
+                        // activation-linked effects: one burst + one pulse per
+                        // real record (counted here, drawn by the renderer)
+                        self.bursts_total += 1;
+                        self.pulses_total += 1;
                     }
                 }
                 if let Some(id) = sess.as_ref() {
@@ -1086,13 +1367,17 @@ impl State {
              {{\"name\":\"selected_layer_selections\",\"status\":\"live\",\"value\":{}}},",
             top, self.sel_layer, self.layer_counts.get(self.sel_layer).copied().unwrap_or(0)
         ));
-        o.push_str(
-            "{\"name\":\"expert_residency\",\"status\":\"unavailable\",\"reason\":\"the v1 event stream carries no per-expert residency (VRAM/RAM/SSD); Stage 1 shows only aggregate cache stats, which are not per-expert and are not drawn as residency\"},\
-             {\"name\":\"routing_scores\",\"status\":\"unavailable\",\"reason\":\"serve-path weights are all 0.0 in the trace (ids only), so no score exists to display\"},\
-             {\"name\":\"token_text\",\"status\":\"unavailable\",\"reason\":\"the v1 stream carries pass_index and position but no decoded token text\"},\
-             {\"name\":\"co_activation_matrix\",\"status\":\"unavailable\",\"reason\":\"not implemented in this stage; the events needed (per-pass id sets) are present, the view is not\"},\
-             {\"name\":\"expert_history_replay\",\"status\":\"unavailable\",\"reason\":\"historical playback lands in Stage 7 (SQLite history); the live hint is cumulative since app start\"}\
-            ],\"layer_selections\":[");
+        o.push_str(&format!(
+            "{{\"name\":\"expert_residency\",\"status\":\"unavailable\",\"reason\":\"the v1 event stream carries no per-expert residency (VRAM/RAM/SSD); Stage 1 shows only aggregate cache stats, which are not per-expert and are not drawn as residency\"}},\n\
+             {{\"name\":\"routing_scores\",\"status\":\"unavailable\",\"reason\":\"serve-path weights are all 0.0 in the trace (ids only), so no score exists to display\"}},\n\
+             {{\"name\":\"co_activation_matrix\",\"status\":\"live\",\"value\":{{\"records_folded\":{},\"distinct_pairs\":{}}},\"note\":\"pairs counted inside each record's real top-k set; view 6 draws them\"}},\n\
+             {{\"name\":\"historical_trails\",\"status\":\"live\",\"value\":{{\"cells_with_history\":{},\"total_selections\":{}}},\"note\":\"per-cell counts with the event timestamps they arrived with (t key toggles the trail bars)\"}},\n\
+             {{\"name\":\"token_text\",\"status\":\"unavailable\",\"reason\":\"the v1 stream carries pass_index and position but no decoded token text\"}},\n\
+             {{\"name\":\"expert_history_replay\",\"status\":\"unavailable\",\"reason\":\"historical playback lands in Stage 7 (SQLite history); the live trail is cumulative since app start\"}}\n\
+            ],\"layer_selections\":[",
+            self.pairs_records, self.pairs_distinct(), self.cells_with_history(),
+            self.history_totals().0
+        ));
         for (i, c) in self.layer_counts.iter().enumerate() {
             if i > 0 {
                 o.push(',');
@@ -1462,11 +1747,78 @@ impl State {
         o.push_str(&self.panels());
         o.push(',');
 
-        o.push_str(&format!("\"rain\":{},\"frames\":{},\"redraw_requests\":{},\"repaints_unchanged\":{},\"wakes_skipped\":{},\"requested_frames\":{},\"pending_redraw\":{},\"frames_change\":{},\"frames_anim\":{},\"frames_resize\":{},\"frames_spurious\":{},\"last_frame\":{{\"quads\":{},\"glyphs\":{},\"lamps\":{},\"streams\":{}}}",
+        // ------------------------------------------------ Stage 6: theme + interaction
+        //
+        // Written as plain concatenation rather than one big format!: every JSON
+        // brace here is structural, and a format! string would need them doubled
+        // (a brace-count mistake there silently produced invalid JSON once).
+        o.push_str(&crate::render::theme_json());
+        o.push(',');
+        o.push_str("\"settings\":{\"rain\":");
+        o.push_str(if self.rain { "true" } else { "false" });
+        o.push_str(",\"rain_density\":");
+        o.push_str(&format!("{:.2}", self.rain_density));
+        o.push_str(",\"rain_speed\":");
+        o.push_str(&format!("{:.2}", self.rain_speed));
+        o.push_str(",\"glow\":");
+        o.push_str(&format!("{:.2}", self.glow));
+        o.push_str(",\"wash_alpha\":");
+        o.push_str(&format!("{:.2}", crate::render::WASH_ALPHA));
+        o.push_str(",\"bg_opacity\":");
+        o.push_str(&format!("{:.2}", crate::render::BG_OPACITY));
+        o.push_str(",\"trails\":");
+        o.push_str(if self.trails { "true" } else { "false" });
+        o.push_str(",\"motion\":\"");
+        o.push_str(if self.motion_reduced { "reduced" } else { "full" });
+        o.push_str("\",\"banner\":{\"enabled\":");
+        o.push_str(if self.banner.enabled { "true" } else { "false" });
+        o.push_str(&format!(",\"interval_s\":{:.1},\"phase\":\"{}\",\"phase_id\":{},\"progress\":{:.3},\"cycles\":{},\"text\":\"FOLLOW THE WHITE RABBIT\"}}",
+            self.banner.interval_s, self.banner.phase_name(), self.banner.phase,
+            self.banner.progress, self.banner.cycles));
+        o.push_str(",\"fps_ceiling\":60,\"keys\":\"+/- zoom · w/a/s/d pan · 0 reset · t trails · 1-6 views · b banner · r rain · j/k layer\"},");
+
+        let (r0, r1, r2, r3) = self.view_rect;
+        o.push_str(&format!("\"viewport\":{{\"zoom\":{:.3},\"pan_x\":{:.2},\"pan_y\":{:.2},\"min_zoom\":{},\"max_zoom\":{},\"rect\":{{\"x\":{:.2},\"y\":{:.2},\"w\":{:.2},\"h\":{:.2}}},\"cell\":{:.3},\"cell_h\":{:.3},\"visible_cells\":{},\"layers\":{},\"experts\":{},\"lattice_panel\":{{\"w\":{:.1},\"h\":{:.1}}}}},",
+            self.zoom, self.pan_x, self.pan_y, MIN_ZOOM, MAX_ZOOM, r0, r1, r2, r3,
+            self.view_cell, self.view_cell_h, self.visible_cells, self.layers, self.experts,
+            r2 / self.zoom.max(0.001), r3 / self.zoom.max(0.001)));
+
+        let (hist_total, hist_first, hist_last) = self.history_totals();
+        o.push_str("\"trails\":{\"enabled\":");
+        o.push_str(if self.trails { "true" } else { "false" });
+        o.push_str(&format!(",\"cells_with_history\":{},\"total_selections\":{},\"first_event_ts\":{:.3},\"last_event_ts\":{:.3},\"span_s\":{:.1}",
+            self.cells_with_history(), hist_total, hist_first, hist_last,
+            (hist_last - hist_first).max(0.0)));
+        o.push_str(",\"mode\":\"cumulative since app start · per-cell counts and the collector timestamps of the events that produced them\"},");
+
+        o.push_str(&format!("\"coactivation\":{{\"records_folded\":{},\"pairs_total\":{},\"distinct_pairs\":{},\"top\":[",
+            self.pairs_records, self.pairs_total(), self.pairs_distinct()));
+        for (i, (a, b, c)) in self.top_pairs(20).iter().enumerate() {
+            if i > 0 {
+                o.push(',');
+            }
+            o.push_str(&format!("{{\"a\":{},\"b\":{},\"count\":{}}}", a, b, c));
+        }
+        o.push_str("],\"source\":\"each expert_selected event carries the whole top-k set for one layer+position, so every pair inside it co-occurred; pairs are counted expert-major over all layers\"},");
+
+        o.push_str(&format!("\"effects\":{{\"activation_bursts_total\":{},\"pulses_total\":{},",
+            self.bursts_total, self.pulses_total));
+        o.push_str("\"source\":\"one burst and one pulse per real expert_selected record (activation-linked rain intensification, §8.3); nothing is spawned per frame and nothing without an event\"},");
+
+        o.push_str("\"input_selftest\":{\"enabled\":");
+        o.push_str(if self.selftest_enabled { "true" } else { "false" });
+        o.push_str(&format!(",\"source\":\"{}\",\"commands_applied\":{},\"errors\":{},\"last\":\"{}\",\"last_ts\":{:.3}",
+            json::esc(&self.selftest_source), self.selftest_commands, self.selftest_errors,
+            json::esc(&self.selftest_last), self.selftest_last_ts));
+        o.push_str(",\"note\":\"labelled INPUT SELF-TEST: a control file that injects the same commands the keyboard does (zoom/pan/view/trails). It drives UI state only and never produces telemetry\"},\n");
+
+        o.push_str(&format!("\"rain\":{},\"frames\":{},\"redraw_requests\":{},\"repaints_unchanged\":{},\"wakes_skipped\":{},\"requested_frames\":{},\"pending_redraw\":{},\"frames_change\":{},\"frames_anim\":{},\"frames_resize\":{},\"frames_spurious\":{},\"last_frame\":{{\"quads\":{},\"glyphs\":{},\"lamps\":{},\"streams\":{},\"trail_quads\":{},\"pulse_quads\":{},\"banner_quads\":{},\"visible_cells\":{},\"rain_families\":{}}}",
             self.rain, self.frames, self.redraw_requests, self.repaints_unchanged, self.wakes_skipped,
             self.requested_frames, self.pending_redraw,
             self.frames_change, self.frames_anim, self.frames_resize, self.frames_spurious,
-            self.last_frame.quads, self.last_frame.glyphs, self.last_frame.lamps, self.last_frame.streams));
+            self.last_frame.quads, self.last_frame.glyphs, self.last_frame.lamps, self.last_frame.streams,
+            self.last_frame.trail_quads, self.last_frame.pulse_quads, self.last_frame.banner_quads,
+            self.last_frame.visible_cells, self.last_frame.families));
         o.push('}');
         o
     }
