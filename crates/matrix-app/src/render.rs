@@ -2385,7 +2385,7 @@ impl Renderer {
         self.push_text(tb, SZ_MICRO, x, uy + 14.0, "· RESIDENCY TRUTH — none; lattice tint is a profile ESTIMATE", FAINT, max_x);
         self.push_text(tb, SZ_MICRO, x, uy + 27.0, "· ROUTING SCORES — serve-path weights are all 0.0", FAINT, max_x);
         self.push_text(tb, SZ_MICRO, x, uy + 40.0, "· TOKEN TEXT — pass_index only, no decoded tokens", FAINT, max_x);
-        self.push_text(tb, SZ_MICRO, x, uy + 53.0, "· HISTORY REPLAY — Stage 7 (trails + view 6 are live)", FAINT, max_x);
+        self.push_text(tb, SZ_MICRO, x, uy + 53.0, "· PLAYBACK — live trails only; store replay is CLI", FAINT, max_x);
     }
 
     // ------------------------------------------------------------ perf

@@ -1514,7 +1514,7 @@ impl State {
              {{\"name\":\"co_activation_matrix\",\"status\":\"live\",\"value\":{{\"records_folded\":{},\"distinct_pairs\":{}}},\"note\":\"pairs counted inside each record's real top-k set; view 6 draws them\"}},\n\
              {{\"name\":\"historical_trails\",\"status\":\"live\",\"value\":{{\"cells_with_history\":{},\"total_selections\":{}}},\"note\":\"per-cell counts with the event timestamps they arrived with (t key toggles the trail bars)\"}},\n\
              {{\"name\":\"token_text\",\"status\":\"unavailable\",\"reason\":\"the v1 stream carries pass_index and position but no decoded token text\"}},\n\
-             {{\"name\":\"expert_history_replay\",\"status\":\"unavailable\",\"reason\":\"historical playback lands in Stage 7 (SQLite history); the live trail is cumulative since app start\"}}\n\
+             {{\"name\":\"expert_history_replay\",\"status\":\"unavailable\",\"reason\":\"stored-session playback is not in this build: the live trail is cumulative since app start, while the collector keeps the full routing history for --replay and --export\"}}\n\
             ],\"layer_selections\":[",
             self.pairs_records, self.pairs_distinct(), self.cells_with_history(),
             self.history_totals().0
