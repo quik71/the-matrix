@@ -1697,23 +1697,26 @@ impl Renderer {
                 pass.draw(0..6, 0..nr);
                 pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
             }
-            // cells + lattice + layer-row heat
-            if self.n_cells > 0 {
+            // cells + lattice + layer-row heat. In the co-activation view the same
+            // panel holds the pair matrix, so the lattice's own cell/grid buffers
+            // must not be drawn over it.
+            let draw_lattice = has_grid && v.view != VIEW_COACT;
+            if draw_lattice && self.n_cells > 0 {
                 pass.set_scissor_rect(clip_rect.0, clip_rect.1, clip_rect.2, clip_rect.3);
                 pass.set_bind_group(1, &self.cells.bind, &[]);
                 pass.draw(0..6, 0..self.n_cells as u32);
             }
-            if self.n_lattice > 0 {
+            if draw_lattice && self.n_lattice > 0 {
                 pass.set_bind_group(1, &self.lattice.bind, &[]);
                 pass.draw(0..6, 0..self.n_lattice as u32);
             }
-            if nh > 0 {
+            if draw_lattice && nh > 0 {
                 pass.set_bind_group(1, &self.rowheat.bind, &[]);
                 pass.draw(0..6, 0..nh);
             }
             pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
             // wash clipped to the lattice footprint
-            if nw > 0 {
+            if nw > 0 && draw_lattice {
                 pass.set_pipeline(&self.glyph_pipe);
                 let xs = ((v.grid.x * sc).max(0.0)) as u32;
                 let ys = ((v.grid.y * sc).max(0.0)) as u32;
