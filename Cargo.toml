@@ -1,6 +1,13 @@
 [package]
 name = "matrix-collect"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
+# Only external dependency, required by spec: SQLite persistence (bundled =
+# self-contained C amalgamation, no system libsqlite3 version drift on main).
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
+
+[profile.release]
+opt-level = 2
+debug = false

@@ -1,1 +1,8 @@
 /target
+# runtime state (never committed; lives on host main under /home/main/the-matrix)
+/run/
+/data/
+/logs/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
