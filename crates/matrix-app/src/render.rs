@@ -126,6 +126,9 @@ const GREEN_MAX: f32 = 0.72;
 const BLOOM_MIN: f32 = 0.5;
 const BLOOM_CAP: usize = 2200;
 const TRAIL_PAINT_LIMIT: usize = 9000;
+/// Cap on the 4-quad activation border: 600 lit cells is already a wall of
+/// light, and the cap keeps a full-lattice flash from quadrupling the quad count.
+const BORDER_CAP: usize = 600;
 
 const FLASH_IN: f64 = 80.0;
 const HOLD: f64 = 260.0;
@@ -143,6 +146,8 @@ const MAX_BURSTS: usize = 32;
 /// real history (distinct in colour and position from the live lamp fill).
 const TRAIL_BAR_H: f32 = 0.34;
 const TRAIL_MIN_CELL: f32 = 1.0;
+/// Quad budget for the trail pass (each bar is one instanced quad).
+const TRAIL_QUAD_CAP: usize = 3000;
 /// Layer-row activity decays with this time constant (ms) — a real measurement
 /// of recent routing activity per layer, not a decoration.
 const HEAT_TAU: f32 = 1400.0;
@@ -1533,6 +1538,7 @@ impl Renderer {
         if has_grid {
             let mut painted = 0usize;
             let mut bloom_n = 0usize;
+            let mut borders = 0usize;
             let (l0, l1, e0, e1) = v.vis;
             let mut push_lamp = |m: &Marker, a: f32| {
                 if painted >= TRAIL_PAINT_LIMIT {
@@ -1552,8 +1558,10 @@ impl Renderer {
                         color: [0.470, 1.0, 0.651, g],
                     });
                     // §7.3 "apply a bright border or glow": a 1 px white-green
-                    // stroke on the cells that are actually lit right now
-                    if a >= 0.5 {
+                    // stroke on the cells that are actually lit right now, capped
+                    // so a full-lattice flash cannot quadruple the quad count
+                    if a >= 0.5 && borders < BORDER_CAP {
+                        borders += 1;
                         let bw = (v.cell * 0.22).clamp(0.8, 1.6);
                         for (rx, ry, rw, rh) in [
                             (x, y, v.cell.max(1.0), bw),
@@ -1873,13 +1881,18 @@ impl Renderer {
             }
             n
         };
-        // smallest threshold that still fits the quad budget (so a dense
-        // lattice keeps its long tail of cells instead of only the peak)
-        let thresh = (0..7u32)
-            .rev()
-            .map(|k| (maxc >> k).max(1))
-            .find(|t| count_at(*t) <= 6000)
-            .unwrap_or(maxc);
+        // Smallest threshold that still fits the quad budget, so a dense lattice
+        // keeps its long tail of cells instead of only the peak. The common case
+        // (fewer than the budget) costs one pass.
+        let thresh = if count_at(1) <= TRAIL_QUAD_CAP {
+            1
+        } else {
+            (1..7u32)
+                .rev()
+                .map(|k| (maxc >> k).max(1))
+                .find(|t| count_at(*t) <= TRAIL_QUAD_CAP)
+                .unwrap_or(maxc)
+        };
         let lmax = (maxc as f32).ln().max(1.0);
         let mut n = 0usize;
         for l in l0..l1 {
