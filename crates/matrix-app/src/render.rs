@@ -1314,7 +1314,8 @@ impl Renderer {
         let (model_txt, model_col) = match (&st.model, st.meta_source.as_deref()) {
             (Some(m), Some("collector-store")) => (format!("MODEL {m} · collector store"), DIM),
             (Some(m), _) => (format!("MODEL {m}"), DIM),
-            (None, _) => ("MODEL unavailable — no meta event".to_string(), AMBER),
+            (None, None) => ("MODEL unavailable — no meta event on the socket".to_string(), AMBER),
+            (None, Some(src)) => (format!("MODEL unavailable — {src} meta carried no engine block"), AMBER),
         };
         let mw = text::text_width(self.face(SZ_SMALL), &model_txt) + 16.0;
         let mx = (h.right() - 12.0 - mw).max(hx + 320.0);
