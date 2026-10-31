@@ -110,24 +110,6 @@ impl Store {
         Ok(s)
     }
 
-    /// Read-only connection for replay/tail queries. No schema work: the
-    /// producer owns the schema, and a reader must never take a write lock
-    /// (that would stall accepted subscribers behind the producer's transaction).
-    pub fn open_readonly(path: &str) -> Result<Store, String> {
-        let conn = Connection::open_with_flags(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(|e| format!("open_ro {path}: {e}"))?;
-        conn.busy_timeout(std::time::Duration::from_secs(2))
-            .map_err(|e| e.to_string())?;
-        Ok(Store {
-            conn,
-            tx: false,
-            db_path: path.to_string(),
-        })
-    }
-
     pub fn begin(&mut self) -> Result<(), String> {
         if !self.tx {
             self.conn
@@ -507,12 +489,18 @@ impl Store {
     pub fn tail(&self, session: &str, limit: usize) -> Result<(Vec<(i64, String)>, u64), String> {
         // One snapshot for both queries: otherwise the event count can be read
         // after new commits and the "truncated" figure would be inflated by
-        // events that arrived between the two statements.
-        self.conn
-            .execute_batch("BEGIN DEFERRED")
-            .map_err(|e| format!("tail begin: {e}"))?;
+        // events that arrived between the two statements. When the caller (the
+        // producer) already holds a write transaction, its own snapshot is used.
+        let own_tx = !self.tx;
+        if own_tx {
+            self.conn
+                .execute_batch("BEGIN DEFERRED")
+                .map_err(|e| format!("tail begin: {e}"))?;
+        }
         let r = self.tail_inner(session, limit);
-        let _ = self.conn.execute_batch("COMMIT");
+        if own_tx {
+            let _ = self.conn.execute_batch("COMMIT");
+        }
         r
     }
 
@@ -551,38 +539,10 @@ impl Store {
             .map_err(|e| e.to_string())
     }
 
-    pub fn last_session(&self) -> Option<String> {
-        self.conn
-            .query_row(
-                "SELECT id FROM sessions ORDER BY started_ts DESC, first_seq DESC LIMIT 1",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .ok()
-    }
-
-    pub fn integrity_check(&self) -> String {
-        self.conn
-            .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
-            .unwrap_or_else(|e| format!("error: {e}"))
-    }
-
     pub fn wal_bytes(&self) -> u64 {
         std::fs::metadata(format!("{}-wal", self.db_path))
             .map(|m| m.len())
             .unwrap_or(0)
     }
 
-    pub fn count(&self, sql: &str, session: Option<&str>) -> i64 {
-        match session {
-            Some(s) => self
-                .conn
-                .query_row(sql, params![s], |r| r.get::<_, i64>(0))
-                .unwrap_or(-1),
-            None => self
-                .conn
-                .query_row(sql, [], |r| r.get::<_, i64>(0))
-                .unwrap_or(-1),
-        }
-    }
 }

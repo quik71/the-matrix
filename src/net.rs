@@ -67,7 +67,15 @@ pub struct Item {
     pub seq: i64,
     pub line: String,
     pub droppable: bool,
-    pub kind: &'static str,
+}
+
+/// What a connecting subscriber gets before the live stream: the stored tail of
+/// the current session plus the seq floor that separates replay from live.
+#[derive(Debug, Clone)]
+pub struct Preload {
+    pub lines: Vec<String>,
+    pub floor: i64,
+    pub truncated: u64,
 }
 
 #[derive(Debug)]
@@ -81,7 +89,7 @@ pub struct SubState {
     pub sent: u64,
     pub max_depth: usize,
     pub closed: bool,
-    pub ready: bool,
+    pub preload: Option<Preload>,
     pub peer: String,
     pub registered_ts: f64,
     pub replayed: u64,
@@ -112,7 +120,7 @@ impl Sub {
                     sent: 0,
                     max_depth: 0,
                     closed: false,
-                    ready: false,
+                    preload: None,
                     peer,
                     registered_ts: ts,
                     replayed: 0,
@@ -125,7 +133,7 @@ impl Sub {
         }
     }
 
-    pub fn push(&self, seq: i64, line: String, droppable: bool, kind: &'static str) {
+    pub fn push(&self, seq: i64, line: String, droppable: bool) {
         let (m, cv) = &*self.st;
         let mut g = match m.lock() {
             Ok(g) => g,
@@ -162,7 +170,6 @@ impl Sub {
             seq,
             line,
             droppable,
-            kind,
         });
         if g.items.len() > g.max_depth {
             g.max_depth = g.items.len();
@@ -170,8 +177,11 @@ impl Sub {
         cv.notify_one();
     }
 
-    pub fn set_floor_and_prune(&self, floor: i64) {
-        let (m, _) = &*self.st;
+    /// Producer-side: install the replay preload and the seq floor in one step.
+    /// Items already queued at or below the floor were replayed, so they are
+    /// pruned as duplicates rather than delivered twice.
+    pub fn set_preload(&self, lines: Vec<String>, floor: i64, truncated: u64) {
+        let (m, cv) = &*self.st;
         let mut g = match m.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
@@ -181,25 +191,12 @@ impl Sub {
         g.items.retain(|it| it.seq > floor);
         let removed = before - g.items.len();
         g.pruned += removed as u64;
-        g.ready = true;
-    }
-
-    pub fn mark_ready(&self) {
-        let (m, cv) = &*self.st;
-        let mut g = match m.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        g.ready = true;
+        g.preload = Some(Preload {
+            lines,
+            floor,
+            truncated,
+        });
         cv.notify_all();
-    }
-
-    pub fn closed(&self) -> bool {
-        let (m, _) = &*self.st;
-        match m.lock() {
-            Ok(g) => g.closed,
-            Err(p) => p.into_inner().closed,
-        }
     }
 
     pub fn close(&self) {
@@ -227,40 +224,61 @@ impl Sub {
     }
 }
 
-/// Serve one accepted connection: optional replay of the session tail, then the
-/// live stream. Returns when the peer goes away.
-pub fn serve(
-    mut stream: UnixStream,
-    sub: Arc<Sub>,
-    replay: Vec<String>,
-    replay_high_water: i64,
-    replay_truncated: u64,
-    stop: Arc<AtomicBool>,
-) {
+/// Serve one accepted connection: write the producer-supplied replay preload,
+/// then the live stream. Returns when the peer goes away.
+pub fn serve(mut stream: UnixStream, sub: Arc<Sub>, stop: Arc<AtomicBool>) {
     stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
-    let mut out = ReplayWriter { s: &mut stream, bytes: 0, failed: false };
+    // Wait for the producer to fill the preload (it owns the only DB writer, so
+    // its snapshot cannot race live events: nothing is lost in the handover).
+    let preload = {
+        let t0 = std::time::Instant::now();
+        loop {
+            let (m, cv) = &*sub.st;
+            let mut g = match m.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if let Some(p) = g.preload.take() {
+                break p;
+            }
+            let _ = cv.wait_timeout(g, Duration::from_millis(100));
+            if t0.elapsed() > Duration::from_secs(10) {
+                break Preload {
+                    lines: Vec::new(),
+                    floor: 0,
+                    truncated: 0,
+                };
+            }
+        }
+    };
+    let mut out = ReplayWriter {
+        s: &mut stream,
+        bytes: 0,
+        failed: false,
+    };
     let t_replay = std::time::Instant::now();
-    for l in &replay {
+    for l in &preload.lines {
         out.write_line(l);
     }
-    if !replay.is_empty() {
+    if !preload.lines.is_empty() || preload.truncated > 0 {
         eprintln!(
-            "subscriber {}: replay delivered {} lines / {} bytes in {:.1} ms (failed={})",
+            "subscriber {}: replay {} lines / {} bytes in {:.1} ms (truncated {}, floor {}, failed={})",
             sub.name,
-            replay.len(),
+            preload.lines.len(),
             out.bytes,
             t_replay.elapsed().as_secs_f64() * 1000.0,
+            preload.truncated,
+            preload.floor,
             out.failed
         );
     }
     {
         let (m, _) = &*sub.st;
         if let Ok(mut g) = m.lock() {
-            g.replayed = replay.len() as u64;
-            g.replay_truncated = replay_truncated;
+            g.replayed = preload.lines.len() as u64;
+            g.replay_truncated = preload.truncated;
         }
     }
-    sub.set_floor_and_prune(replay_high_water);
     if out.failed {
         sub.close();
         return;

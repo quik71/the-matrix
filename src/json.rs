@@ -36,18 +36,9 @@ impl Value {
     pub fn as_i64(&self) -> Option<i64> {
         self.as_f64().map(|f| f as i64)
     }
-    pub fn as_u64(&self) -> Option<u64> {
-        self.as_f64().map(|f| f.max(0.0) as u64)
-    }
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Value::Str(s) => Some(s),
-            _ => None,
-        }
-    }
-    pub fn as_bool(&self) -> Option<bool> {
-        match self {
-            Value::Bool(b) => Some(*b),
             _ => None,
         }
     }

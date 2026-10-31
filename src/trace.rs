@@ -56,6 +56,11 @@ pub struct Tailer {
 
     cur: Vec<Rec>,
     last_layer: i32,
+    // Start (or restart) mid-stream: drop records until the next pass boundary
+    // (layer 0) instead of emitting an incomplete pass fragment.
+    sync_pass: bool,
+    sync_skipped: u64,
+    sync_start: Option<u64>,
 
     pub records_seen: u64,
     pub records_in_passes: u64,
@@ -87,6 +92,9 @@ impl Tailer {
             anchor: 0,
             cur: Vec::new(),
             last_layer: -1,
+            sync_pass: true,
+            sync_skipped: 0,
+            sync_start: None,
             records_seen: 0,
             records_in_passes: 0,
             passes: 0,
@@ -109,6 +117,9 @@ impl Tailer {
         self.buf.clear();
         self.cur.clear();
         self.last_layer = -1;
+        self.sync_pass = true;
+        self.sync_skipped = 0;
+        self.sync_start = None;
     }
 
     pub fn file_size(&self) -> u64 {
@@ -203,6 +214,37 @@ impl Tailer {
             let need = 8 + 8 * k as usize;
             if i + need > n {
                 break; // partial record: wait for the next read
+            }
+            if self.sync_pass {
+                if layer != 0 {
+                    let off = self.buf_off + i as u64;
+                    if self.sync_start.is_none() {
+                        self.sync_start = Some(off);
+                    }
+                    self.sync_skipped += need as u64;
+                    self.skipped_bytes += need as u64;
+                    i += need;
+                    continue;
+                }
+                // layer 0 == first record of a pass: from here on every pass we
+                // assemble is complete.
+                if self.sync_skipped > 0 {
+                    let start = self.sync_start.unwrap_or(self.buf_off);
+                    let end = self.buf_off + i as u64;
+                    gaps.push(TraceGap {
+                        reason: "cold_start_partial_pass",
+                        byte_start: start,
+                        byte_end: end,
+                        bytes: self.sync_skipped,
+                        detail: format!(
+                            "{} byte(s) of a pass that began before the collector's start offset were skipped, never emitted as a partial pass",
+                            self.sync_skipped
+                        ),
+                    });
+                    self.sync_skipped = 0;
+                    self.sync_start = None;
+                }
+                self.sync_pass = false;
             }
             let ids: Vec<i32> = (0..k as usize)
                 .map(|x| rd_i32(&self.buf, i + 8 + 4 * x))
@@ -325,6 +367,7 @@ impl Tailer {
                 self.buf_off = size;
                 self.cur.clear();
                 self.last_layer = -1;
+                self.sync_pass = true;
             } else {
                 self.rewinds += 1;
                 gaps.push(TraceGap {
@@ -337,6 +380,7 @@ impl Tailer {
                 self.buf.clear();
                 self.cur.clear();
                 self.last_layer = -1;
+                self.sync_pass = true;
                 self.offset = if self.anchor <= size { self.anchor } else { size };
                 self.buf_off = self.offset;
             }

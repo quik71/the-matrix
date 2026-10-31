@@ -298,7 +298,6 @@ struct Window {
     id: String,
     start_ts: f64,
     req_before: i64,
-    tier: &'static str,
     passes: u64,
     records: u64,
     positions: u64,
@@ -308,8 +307,6 @@ struct Window {
     last_seq: i64,
     last_activity: Instant,
     pending: Option<(i64, i64, Instant)>, // req_after, delta, detected_at
-    flushed_skipped: u64,
-    flushed_resyncs: u64,
 }
 
 // --------------------------------------------------------------------- core
@@ -320,7 +317,6 @@ struct Core {
     seq: i64,
     run_id: String,
     subs: Arc<Mutex<Vec<Arc<Sub>>>>,
-    next_sub: u64,
     metrics: Metrics,
     req_total_last: i64,
     win: Option<Window>,
@@ -335,7 +331,6 @@ struct Core {
     db_err: String,
     last_commit_ms: f64,
     t0: Instant,
-    t0_epoch: f64,
     last_metrics: Instant,
     last_status: Instant,
     last_hw: Instant,
@@ -349,6 +344,8 @@ struct Core {
     record_rate: f64,
     byte_rate: f64,
     engine_errors: u64,
+    reg_rx: std::sync::mpsc::Receiver<Arc<Sub>>,
+    last_finished: Option<String>,
 }
 
 impl Core {
@@ -370,7 +367,7 @@ impl Core {
         {
             let subs = self.subs.lock().unwrap_or_else(|p| p.into_inner());
             for s in subs.iter() {
-                s.push(seq, line.clone(), droppable, kind);
+                s.push(seq, line.clone(), droppable);
             }
         }
         if let Some(st) = self.store.as_mut() {
@@ -399,7 +396,6 @@ impl Core {
             id: id.clone(),
             start_ts: ts,
             req_before: self.req_total_last,
-            tier: "windowed",
             passes: 0,
             records: 0,
             positions: 0,
@@ -409,8 +405,6 @@ impl Core {
             last_seq: first_seq,
             last_activity: Instant::now(),
             pending: None,
-            flushed_skipped: 0,
-            flushed_resyncs: 0,
         });
         self.sessions_total += 1;
         let body = format!(
@@ -431,6 +425,7 @@ impl Core {
             Some(w) => w,
             None => return,
         };
+        self.last_finished = Some(w.id.clone());
         let ts = now_unix();
         let dur = ts - w.start_ts;
         let body = format!(
@@ -723,14 +718,22 @@ impl Core {
         let mut parts: Vec<String> = Vec::new();
         for s in subs.iter() {
             let (depth, drops, forced, sent) = s.depth_drops();
-            let (max_depth, replayed, trunc, bytes_out, closed) = {
+            let (max_depth, replayed, trunc, bytes_out, closed, peer, since) = {
                 let (m, _) = &*s.st;
                 let g = m.lock().unwrap_or_else(|p| p.into_inner());
-                (g.max_depth, g.replayed, g.replay_truncated, g.bytes_out, g.closed)
+                (
+                    g.max_depth,
+                    g.replayed,
+                    g.replay_truncated,
+                    g.bytes_out,
+                    g.closed,
+                    g.peer.clone(),
+                    g.registered_ts,
+                )
             };
             parts.push(format!(
-                "{{\"id\":\"{}\",\"depth\":{},\"max_depth\":{},\"sent\":{},\"dropped_droppable\":{},\"forced_drops\":{},\"replayed\":{},\"replay_truncated\":{},\"bytes_out\":{},\"closed\":{}}}",
-                s.name, depth, max_depth, sent, drops, forced, replayed, trunc, bytes_out, closed
+                "{{\"id\":\"{}\",\"conn\":\"{}\",\"sub_id\":{},\"since\":{:.3},\"depth\":{},\"max_depth\":{},\"sent\":{},\"dropped_droppable\":{},\"forced_drops\":{},\"replayed\":{},\"replay_truncated\":{},\"bytes_out\":{},\"closed\":{}}}",
+                s.name, json::esc(&peer), s.id, since, depth, max_depth, sent, drops, forced, replayed, trunc, bytes_out, closed
             ));
         }
         format!("[{}]", parts.join(","))
@@ -955,6 +958,45 @@ impl Core {
         });
     }
 
+    /// Build the replay preload for subscribers that connected since the last
+    /// loop iteration. Runs on the producer thread, which is the only writer, so
+    /// the snapshot is exactly "everything emitted so far" — no event can fall
+    /// between the replay and the live stream.
+    fn handle_registrations(&mut self) {
+        let mut batch: Vec<Arc<Sub>> = Vec::new();
+        while let Ok(s) = self.reg_rx.try_recv() {
+            batch.push(s);
+        }
+        for sub in batch {
+            let sess = self
+                .win
+                .as_ref()
+                .map(|w| w.id.clone())
+                .or_else(|| self.last_finished.clone());
+            let mut lines: Vec<String> = Vec::new();
+            let mut floor: i64 = 0;
+            let mut trunc: u64 = 0;
+            if let (Some(st), Some(s)) = (self.store.as_ref(), sess.as_ref()) {
+                if let Ok((pairs, total)) = st.tail(s, self.cfg.replay_max) {
+                    floor = pairs.last().map(|(q, _)| *q).unwrap_or(0);
+                    trunc = total.saturating_sub(pairs.len() as u64);
+                    lines = pairs.into_iter().map(|(_, l)| l).collect();
+                }
+            }
+            if !lines.is_empty() || trunc > 0 {
+                eprintln!(
+                    "subscriber {}: preload {} line(s) of {:?}, truncated {}, floor {}",
+                    sub.name,
+                    lines.len(),
+                    sess,
+                    trunc,
+                    floor
+                );
+            }
+            sub.set_preload(lines, floor, trunc);
+        }
+    }
+
     fn checkpoint(&mut self) {
         let off = self.tailer.cursor_offset();
         let anchor = self.tailer.anchor();
@@ -1035,7 +1077,6 @@ fn main() {
         process::id(),
         (now_unix() * 1000.0) as i64
     );
-    let t0_epoch = now_unix();
 
     // ---- store
     let mut store = if cfg.no_persist {
@@ -1126,22 +1167,20 @@ fn main() {
     };
 
     let subs: Arc<Mutex<Vec<Arc<Sub>>>> = Arc::new(Mutex::new(Vec::new()));
-    let active_session: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let last_session: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let stop_flag = Arc::new(AtomicBool::new(false));
     let sub_seq = Arc::new(AtomicU64::new(1));
+    // Subscribers are registered here and their replay preload is built by the
+    // producer thread (the only DB writer), so the replay snapshot can never
+    // miss an event that was emitted before the connection was accepted.
+    let (reg_tx, reg_rx) = std::sync::mpsc::channel::<Arc<Sub>>();
 
     // Acceptor: one thread per subscriber.
     {
         let subs = subs.clone();
         let stop = stop_flag.clone();
-        let db_path = cfg.db.clone();
-        let no_persist = cfg.no_persist;
-        let replay_max = cfg.replay_max;
         let queue_cap = cfg.queue_cap;
-        let active = active_session.clone();
-        let last = last_session.clone();
         let sub_seq = sub_seq.clone();
+        let reg_tx = reg_tx.clone();
         thread::spawn(move || {
             let mut peer_idx = 0u64;
             while !stop.load(Ordering::SeqCst) {
@@ -1161,51 +1200,9 @@ fn main() {
                         subs.lock()
                             .unwrap_or_else(|p| p.into_inner())
                             .push(sub.clone());
-                        let (replay, high, trunc, sess) = if no_persist {
-                            (Vec::new(), 0i64, 0u64, None)
-                        } else {
-                            // Replay the current session's stored tail, then live.
-                            let s = active
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner())
-                                .clone()
-                                .or_else(|| last.lock().unwrap_or_else(|p| p.into_inner()).clone());
-                            match s {
-                                Some(sess) => match Store::open_readonly(&db_path) {
-                                    Ok(rd) => match rd.tail(&sess, replay_max) {
-                                        Ok((pairs, total)) => {
-                                            // Floor = last seq actually replayed. Anything older
-                                            // that the bound cut is reported as truncation.
-                                            let high = pairs.last().map(|(s, _)| *s).unwrap_or(0);
-                                            let trunc = total.saturating_sub(pairs.len() as u64);
-                                            (
-                                                pairs.into_iter().map(|(_, l)| l).collect(),
-                                                high,
-                                                trunc,
-                                                Some(sess),
-                                            )
-                                        }
-                                        Err(_) => (Vec::new(), 0i64, 0u64, Some(sess)),
-                                    },
-                                    Err(_) => (Vec::new(), 0i64, 0u64, Some(sess)),
-                                },
-                                None => (Vec::new(), 0i64, 0u64, None),
-                            }
-                        };
+                        let _ = reg_tx.send(sub.clone());
                         let stop2 = stop.clone();
-                        let subs2 = subs.clone();
-                        thread::spawn(move || {
-                            if !replay.is_empty() || trunc > 0 {
-                                eprintln!(
-                                    "subscriber {name}: replay {} events of {:?} (truncated {}, high_water {high})",
-                                    replay.len(),
-                                    sess,
-                                    trunc
-                                );
-                            }
-                            net::serve(stream, sub.clone(), replay, high, trunc, stop2);
-                            let _ = &subs2;
-                        });
+                        thread::spawn(move || net::serve(stream, sub, stop2));
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(50));
@@ -1223,7 +1220,6 @@ fn main() {
         seq: 0,
         run_id: run_id.clone(),
         subs: subs.clone(),
-        next_sub: 0,
         metrics: Metrics::default(),
         req_total_last: -1,
         win: None,
@@ -1238,7 +1234,6 @@ fn main() {
         db_err: String::new(),
         last_commit_ms: 0.0,
         t0: Instant::now(),
-        t0_epoch,
         last_metrics: Instant::now() - Duration::from_secs(3600),
         last_status: Instant::now(),
         last_hw: Instant::now() - Duration::from_secs(3600),
@@ -1252,6 +1247,8 @@ fn main() {
         record_rate: 0.0,
         byte_rate: 0.0,
         engine_errors: 0,
+        reg_rx,
+        last_finished: None,
     };
 
     // Resume seq from storage so seq stays monotonic across restarts.
@@ -1356,6 +1353,9 @@ fn main() {
             }
         }
 
+        // Replay preloads for connections accepted since the last iteration.
+        core.handle_registrations();
+
         if core.last_metrics.elapsed() >= Duration::from_millis(cfg.metrics_ms) {
             core.poll_metrics(&key);
             core.last_metrics = Instant::now();
@@ -1419,16 +1419,6 @@ fn main() {
             core.emit_status();
             core.prune_subs();
             core.last_status = Instant::now();
-        }
-
-        // publish active/last session for reconnecting subscribers
-        {
-            let mut a = active_session.lock().unwrap_or_else(|p| p.into_inner());
-            *a = core.win.as_ref().map(|w| w.id.clone());
-            if let Some(id) = a.clone() {
-                let mut l = last_session.lock().unwrap_or_else(|p| p.into_inner());
-                *l = Some(id);
-            }
         }
 
         if !cfg.no_persist {
