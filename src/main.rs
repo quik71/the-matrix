@@ -19,7 +19,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const EXPECTED_LAYERS: i32 = 48;
 const MAX_EXPERTS: i32 = 512;
 const MAX_K: i32 = 64;
-const MAX_PASS_RECORDS: usize = 48 * 4096;
+const MAX_PASS_RECORDS: usize = 48 * 1024;
+const MAX_CHUNK: usize = 4 * 1024 * 1024; // per-read cap: memory stays bounded
 const MAX_BUF: usize = 8 * 1024 * 1024;
 const RESTART_MAX_BYTES: u64 = 4096;
 
@@ -136,7 +137,7 @@ impl Collector {
     fn find_resync(&self, start: usize) -> Option<usize> {
         let n = self.buf.len();
         let mut j = start + 1;
-        let limit = (start + 65536).min(n);
+        let limit = n; // scan the whole buffer: a cold start can land in a long gap
         while j + 16 <= limit {
             let layer = rd_i32(&self.buf, j);
             let k = rd_i32(&self.buf, j + 4);
@@ -179,7 +180,7 @@ impl Collector {
                     self.skipped_bytes += (j - i) as u64;
                     i = j;
                     continue;
-                } else if n - i > 65536 {
+                } else if n - i > (1 << 20) {
                     let drop = n - i - 1024;
                     self.skipped_bytes += drop as u64;
                     i += drop;
@@ -372,8 +373,12 @@ impl Collector {
                 self.buf_off = self.offset;
             }
         }
-        if size > self.offset {
-            let want = (size - self.offset) as usize;
+        // Drain the backlog in bounded chunks; the buffer never exceeds MAX_CHUNK + carry.
+        let mut progressed = false;
+        let mut budget = 64u32;
+        let mut cur_size = size;
+        while budget > 0 && cur_size > self.offset {
+            let want = ((cur_size - self.offset) as usize).min(MAX_CHUNK);
             let mut chunk = vec![0u8; want];
             let got = match File::open(&self.path).and_then(|mut f| {
                 f.seek(SeekFrom::Start(self.offset))?;
@@ -389,10 +394,10 @@ impl Collector {
                 Ok(read)
             }) {
                 Ok(g) => g,
-                Err(_) => return,
+                Err(_) => break,
             };
             if got == 0 {
-                return;
+                break;
             }
             chunk.truncate(got);
             self.bytes_read += got as u64;
@@ -408,7 +413,11 @@ impl Collector {
                 self.buf_off += drop as u64;
             }
             self.parse_available();
-        } else if self.pass_shape().is_some() {
+            progressed = true;
+            budget -= 1;
+            cur_size = fs::metadata(&self.path).map(|m| m.len()).unwrap_or(self.offset);
+        }
+        if !progressed && self.pass_shape().is_some() {
             // No new bytes and what we hold is a complete pass: emit it. Any
             // following record starts at layer 0, which is also < 47, so this
             // cannot shear a pass that is still being written.
