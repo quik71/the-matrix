@@ -1735,7 +1735,7 @@ impl State {
 
         o.push_str("},\"unavailable\":[");
         o.push_str(
-            "{\"field\":\"expert_residency_per_expert\",\"owner\":\"engine instrumentation\",\"reason\":\"no residency events exist in the v1 stream; aggregate GPU memory is shown instead\"},\
+            "{\"field\":\"expert_residency_truth\",\"owner\":\"engine instrumentation\",\"reason\":\"no per-expert residency truth exists (static profile prefill, no eviction); the lattice paints a labelled ESTIMATE from model structure and says so\"},\n
              {\"field\":\"routing_scores_weights\",\"owner\":\"engine\",\"reason\":\"serve-path trace weights are all 0.0 (ids only)\"},\
              {\"field\":\"token_text\",\"owner\":\"engine\",\"reason\":\"no token text in the v1 stream\"},\
              {\"field\":\"ttft_and_inter_token_latency\",\"owner\":\"collector\",\"reason\":\"perf_sample exposes live.tok_s and totals, no latency fields\"},\
