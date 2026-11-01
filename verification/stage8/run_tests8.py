@@ -187,7 +187,18 @@ def test_a1():
     # when foreign engine traffic lands inside a test window; attempts reported)
     prior = os.path.join(ART, "prior")
     os.makedirs(prior, exist_ok=True)
-    subprocess.run(f"rsync -a --exclude __pycache__ {PRIOR7}/s3 {PRIOR7}/s4 {PRIOR7}/s5 "
+    # Chain-wide freshness stamp. Both copied-harness variants read a stamp;
+    # nothing wrote either of them (s7's copy read STAMP_PATH: FileNotFoundError
+    # waiting to happen; s6 found no prior/session-start.txt and stamped ITSELF,
+    # then called its own chain's earlier suites stale — root cause of the
+    # 3/3 s6-A1 failures on 2026-11-01). Written once, here, before the chain.
+    stamp_ts = f"{time.time()}\n"
+    with open(STAMP_PATH, "w") as fh:
+        fh.write(stamp_ts)
+    with open(f"{prior}/session-start.txt", "w") as fh:
+        fh.write(stamp_ts)
+    subprocess.run(f"rsync -a --exclude __pycache__ --exclude session-start.txt "
+                   f"{PRIOR7}/s3 {PRIOR7}/s4 {PRIOR7}/s5 "
                    f"{PRIOR7}/run_tests6.py {PRIOR7}/results.json {prior}/", shell=True, check=True)
     # fixtures the S5 harness imports from the S3 run
     os.makedirs(f"{prior}/s5/stage3", exist_ok=True)
@@ -210,6 +221,11 @@ def test_a1():
                 pass
             r0 = subprocess.run(cmd, cwd=cwd, shell=True, capture_output=True, text=True,
                                 timeout=2400)
+            try:
+                shutil.copy(os.path.join(cwd, "results.json"),
+                            os.path.join(cwd, f"results-attempt{i}.json"))
+            except (OSError, shutil.Error):
+                pass
             n, f = checks_of(os.path.join(cwd, "results.json"))
             recs.append({"attempt": i, "n": n, "failed": f, "rc": r0.returncode,
                          "tail": (r0.stdout or "")[-300:]})
