@@ -48,18 +48,31 @@ def clean(v):
     return round(v, 3)
 
 
-def trend(name, fn, unit):
+def trend(name, fn, unit, monotone_high_water=False):
     xs, ys = series(fn)
     if not xs:
-        return {"metric": name, "n": 0}
-    return {
+        return {"metric": name, "unit": unit, "n": 0}
+    half = len(ys) // 2
+    # A step (warm-up: caches, first allocations) then a flat hold is not growth,
+    # but a whole-window least-squares fit reports one. Measured on this soak:
+    # app RSS 173.2 -> 184.4 MiB with a whole-window slope of 7.74 MiB/h, while it
+    # reached 184.16 MiB by minute 15.9 and then held (second-half slope 0.27
+    # MiB/h). Both numbers are reported; the leak verdict uses the tail.
+    target = ys[-1] - 0.5
+    idx = next((i for i, v in enumerate(ys) if v >= target), len(ys) - 1)
+    rec = {
         "metric": name, "unit": unit, "n": len(ys),
         "first": clean(ys[0]), "last": clean(ys[-1]),
         "min": clean(min(ys)), "max": clean(max(ys)),
         "median": clean(statistics.median(ys)),
         "slope_per_hour": clean(slope_per_hour(xs, ys)),
+        "tail_slope_per_hour": clean(slope_per_hour(xs[half:], ys[half:])),
+        "tail_first": clean(ys[half]),
+        "plateau_at_min": round((xs[idx] - xs[0]) / 60.0, 1),
+        "monotone_high_water": monotone_high_water,
         "range": clean(max(ys) - min(ys)),
     }
+    return rec
 
 
 OUT["duration_min"] = round((samples[-1]["ts"] - samples[0]["ts"]) / 60.0, 2) if len(samples) > 1 else None
@@ -73,7 +86,8 @@ OUT["trends"] = [
     trend("coll_cpu_pct", lambda s: None, "%"),
     trend("coll_fds", lambda s: (s.get("coll") or {}).get("fds") or None, "fds"),
     trend("queue_depth", lambda s: (s.get("queue") or {}).get("depth"), "events"),
-    trend("queue_max_depth", lambda s: (s.get("queue") or {}).get("max_depth"), "events"),
+    trend("queue_max_depth", lambda s: (s.get("queue") or {}).get("max_depth"), "events",
+          monotone_high_water=True),
     trend("trace_offset_mib", lambda s: ((s.get("queue") or {}).get("trace_offset") or 0) / 1048576.0 or None, "MiB"),
     trend("db_bytes_mib", lambda s: ((s.get("db") or {}).get("db_bytes") or 0) / 1048576.0 or None, "MiB"),
     trend("routing_rows", lambda s: (s.get("db") or {}).get("routing"), "rows"),
@@ -199,16 +213,39 @@ OUT["budgets"] = {"measured": {k: bp.get(k) for k in ("cpu_pct_60s_rain_on", "ap
                   "checks": checks, "all_ok": all(checks.values())}
 
 # ------------------------------------------------- leakage / unbounded growth
+# The candidates are the metrics that would grow without bound if something
+# leaked. `queue_max_depth` is deliberately not one of them: it is a monotone
+# high-water mark (max over the process's life), so a positive slope is a
+# property of the definition, not of the queue — measured here: 1 -> 637 events
+# with a plateau at minute 13.5 and a second-half slope of exactly 0.
+LEAK_CANDIDATES = ("app_rss_mib", "app_hwm_mib", "coll_rss_mib", "app_fds", "coll_fds",
+                   "queue_depth")
 leaks = []
 for t in OUT["trends"]:
-    if t.get("n", 0) < 5 or t.get("slope_per_hour") is None:
+    name = t.get("metric")
+    if name not in LEAK_CANDIDATES or t.get("n", 0) < 5:
         continue
-    name, sl, first, last = t["metric"], t["slope_per_hour"], t.get("first"), t.get("last")
-    if name in ("app_rss_mib", "app_hwm_mib", "coll_rss_mib", "app_fds", "coll_fds", "queue_depth", "queue_max_depth"):
-        if first and sl is not None and sl > max(2.0, 0.02 * abs(first)):
-            leaks.append({"metric": name, "slope_per_hour": sl, "first": first, "last": last,
-                          "verdict": "grows faster than 2%/h or 2 units/h"})
-OUT["unbounded"] = {"suspects": leaks, "verdict": "none" if not leaks else "review"}
+    ts, tfirst = t.get("tail_slope_per_hour"), t.get("tail_first")
+    if ts is None or tfirst is None:
+        continue
+    limit = max(2.0, 0.02 * abs(tfirst))
+    if ts > limit:
+        leaks.append({"metric": name, "tail_slope_per_hour": ts, "limit": round(limit, 3),
+                      "tail_first": tfirst, "last": t.get("last"),
+                      "whole_slope_per_hour": t.get("slope_per_hour"),
+                      "plateau_at_min": t.get("plateau_at_min"),
+                      "verdict": "still growing in the second half of the soak"})
+OUT["unbounded"] = {
+    "suspects": leaks,
+    "verdict": "none" if not leaks else "review",
+    "basis": ("second-half slope vs max(2 units/h, 2%/h of that half's first value); the "
+              "whole-window slope and the plateau minute are kept beside it so a warm-up "
+              "step is visible rather than silently averaged into a trend"),
+    "excluded_by_definition": [{"metric": t["metric"], "why": "monotone high-water mark",
+                                "plateau_at_min": t.get("plateau_at_min"),
+                                "last": t.get("last")}
+                               for t in OUT["trends"] if t.get("monotone_high_water")],
+}
 
 OUT["errors"] = S.get("errors", [])[:20]
 OUT["restored_pair"] = S.get("restored_pair")
@@ -219,4 +256,5 @@ print(json.dumps({k: OUT[k] for k in ("duration_min", "traffic", "budgets", "unb
 print("MODEL", json.dumps(OUT["model"], indent=1))
 print("TRENDS")
 for t in OUT["trends"]:
-    print(" ", t["metric"], t.get("first"), "->", t.get("last"), "slope/h", t.get("slope_per_hour"), t["unit"])
+    print(" ", t.get("metric"), t.get("first"), "->", t.get("last"), "slope/h", t.get("slope_per_hour"),
+          "tail/h", t.get("tail_slope_per_hour"), t.get("unit"))
