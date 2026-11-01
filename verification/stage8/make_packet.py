@@ -20,7 +20,7 @@ CLAIMS = {
         "command": "ssh main 'touch crates/*/src/*.rs && cargo build --release'; python3 run_tests.py all (s3); run_tests4.py all; run_tests5.py all; run_tests6.py all; STAGE7_ART=…/s7 python3 run_tests7.py all",
         "artifacts": ["a1.json", "build.log", "prior/s3/results.json", "prior/s4/results.json",
                       "prior/s5/results.json", "prior/results.json", "s7/results7.json",
-                      "chain-blocked/s3-results.json", "chain-blocked/s4-results.json"],
+                      "chain-blocked/s3-attempt1.json", "chain-blocked/s4-retry.json"],
     },
     "S8-A2": {
         "claim": "matrix-collect and matrix-app run as enabled systemd *user* units with the proven ExecStart, the proven After= ordering and a Wayland environment inherited from uwsm's graphical-session.target; three stop/start cycles each restore a healthy pair without a reboot. Activation at login is honestly pending.",
