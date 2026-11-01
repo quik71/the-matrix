@@ -81,6 +81,19 @@ if [ "$DO_BUILD" = 1 ]; then
 else
   say "build skipped"
   BUILT="$WORK/target/release"
+  # FOOTGUN (caught live on 2026-11-01): --from local rsyncs source into
+  # $WORK but EXCLUDES target/, so a stale $WORK/target from a previous build
+  # silently supplied an OLD binary that the sha diff dutifully reported as
+  # old==new. When --from local points at a built tree, use ITS target, and
+  # always refuse a binary older than its own sources.
+  if [ "$FROM" = "local" ] && [ -x "$SRC/target/release/matrix-collect" ]; then
+    BUILT="$SRC/target/release"
+  fi
+  STALE=$(find "$SRC/crates" -name "*.rs" -newer "$BUILT/matrix-collect" 2>/dev/null | head -1)
+  if [ -n "$STALE" ]; then
+    echo "refusing to deploy: $BUILT/matrix-collect is older than source ($STALE) — build first" >&2
+    exit 4
+  fi
 fi
 for b in matrix-collect matrix-app; do
   [ -x "$BUILT/$b" ] || { echo "missing built binary $BUILT/$b" >&2; exit 4; }
