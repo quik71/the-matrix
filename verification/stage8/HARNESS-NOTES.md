@@ -260,3 +260,36 @@ change for it to go green once the session is unlocked.
   (`a2.log`, `a4.log`, `a5.log`, `a6.log`, `chain-s3.log`, `chain-s4.log`,
   `a1.log`) and the runner logs with timestamps;
 * `/srv/storage/minion-verification/matrix-stage8/packet.json` — the packet.
+
+## Stage-8 regression chain, 2026-11-01 21:0x — two false-fails, root-caused
+
+**S6-A1 "prior suites stale", failed 3/3 attempts.** The chain rsyncs the copied
+suite harnesses into artifacts/prior/ but never wrote the freshness stamp any of
+them read: run_tests7's copy would have crashed on open(STAMP_PATH) (nothing
+writes it), and S6's preflight — which deliberately *keeps* an existing chain
+stamp — found none, so it stamped itself at its own start time and then judged
+its own chain's S3/S4 results stale. 3/3 reproducibility was the tell: a flake
+does not repeat identically. Fix: the chain writes both stamps (its own
+STAMP_PATH and prior/session-start.txt, identical ISO text) before the first
+suite, and the rsync excludes session-start.txt so nothing from an older chain
+can predate it. Stamp format note: comparisons are ISO string compares against
+the results' "finished" fields; an epoch-float stamp would compare vacuously
+true — caught before shipping.
+
+**S6-A3 header invariant, failed 3/3 attempts with the zoom itself perfect**
+(5.0x ratio, region diff 0.97, cells correctly culled). Root cause is a real
+product change, correctly: the header now ADVERTISES live retention status
+(db size, expiry counters) — a Stage-8 feature — so the strip changes over time
+by design. The pre-Stage-8 rule assumed a static 1000x70 strip and measured
+differ_frac 0.058 > 0.01. Band analysis on the actual pair: all change at
+x>=200 (the status readout), x<200 static chrome at 0.0000. Fix preserves the
+property precisely: per-50px header bands; every band at x<200 (title/branding)
+must be pixel-invariant under zoom (strict), status-region bands are measured,
+bounded and reported — a zoom-caused header shift still fails because it cannot
+skip the title bands. The old whole-strip number is kept as informational.
+
+**Chain hygiene:** run_until_green now keeps results-attempt{N}.json for every
+attempt. In this run S5 failed 2/4 and S6 failed 2/4 with the failed-check
+names destroyed on retry — a suite that goes red twice then green is only
+"green" if someone can still say what it was red on. (The earlier 4/4-then-
+3/10 chain restarts had the same amnesia.)
