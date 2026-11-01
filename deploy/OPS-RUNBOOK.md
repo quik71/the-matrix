@@ -250,9 +250,17 @@ It never writes `data/`. `etc/deploy-log.jsonl` records every deploy.
 ./deploy/rollback.sh --to ~/the-matrix/bin/prev/20261101T003841Z-867dd2e6
 ```
 
-Restores both binaries from the chosen `prev/` directory, restarts collector →
-app, and runs the same health gate. Expected exit codes: `0` ok, `3` health
-gate failed, `5` no previous pair.
+Restores both binaries from the chosen `prev/` directory **and the unit files
+that pair was deployed under** (`prev/<stamp>/units/`, saved by `deploy.sh`),
+because a unit can carry a flag an older binary does not parse — Stage 8 added
+`--max-db-mb`, so a binaries-only rollback to a Stage-7 pair leaves the collector
+unable to start. Then restarts collector → app and runs the same health gate.
+Expected exit codes: `0` ok, `3` health gate failed, `5` no previous pair.
+
+A pair older than the current stage may still fail the gate on purpose: the
+Stage-8 gate requires the residency estimate to be painted, which a pre-Stage-7
+app cannot do. Rollback inside a stage (the normal case: one release back) is
+what this proves; crossing a stage boundary also needs the unit snapshot.
 
 ---
 

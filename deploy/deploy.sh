@@ -103,18 +103,30 @@ PREV="$PREFIX/bin/prev/$STAMP-${OLD_SHA_COLLECT:0:8}"
 mkdir -p "$PREV"
 cp -a "$PREFIX/bin/matrix-collect" "$PREV/matrix-collect"
 cp -a "$PREFIX/bin/matrix-app" "$PREV/matrix-app"
+# The unit files are part of the deployment: a pair whose unit carries a flag it
+# does not know (Stage-8 added --max-db-mb) cannot start after a rollback. Save
+# the units that were in force for the pair being replaced, so rollback.sh can
+# put them back with the binaries. A deploy does not render units today, so this
+# is normally the same file; it is the snapshot that makes the manifest true.
+UNIT_DIR="$HOME/.config/systemd/user"
+mkdir -p "$PREV/units"
+for u in "$UNIT_DIR/$UNIT_PREFIX-collect.service" "$UNIT_DIR/$UNIT_PREFIX-app.service"; do
+  [ -f "$u" ] && cp -a "$u" "$PREV/units/"
+done
 python3 - "$PREV" "$STAMP" "$OLD_SHA_COLLECT" "$OLD_SHA_APP" "$NEW_SHA_COLLECT" "$NEW_SHA_APP" "$PREFIX" <<'PY'
-import json, sys, subprocess
+import json, os, sys, subprocess
 prev, stamp, oc, oa, nc, na, prefix = sys.argv[1:8]
 def ver(path, flag):
     try:
         return subprocess.run([path, flag], capture_output=True, text=True, timeout=10).stdout.splitlines()[0]
     except Exception as e:
         return "unknown: %s" % e
+units = sorted(os.listdir(prev + "/units")) if os.path.isdir(prev + "/units") else []
 json.dump({"stamp": stamp, "old_collect_sha": oc, "old_app_sha": oa,
            "new_collect_sha": nc, "new_app_sha": na,
            "old_collect_version": ver(prev + "/matrix-collect", "--version"),
            "old_app_version": ver(prev + "/matrix-app", "--help"),
+           "units_saved": units,
            "prefix": prefix},
           open(prev + "/manifest.json", "w"), indent=1)
 PY

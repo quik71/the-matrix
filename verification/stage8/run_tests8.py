@@ -27,6 +27,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -34,6 +35,11 @@ import time
 ART = os.environ.get("STAGE8_ART", "/srv/storage/minion-verification/matrix-stage8/artifacts")
 REPO = "/srv/storage/work/the-matrix"
 PRIOR7 = "/srv/storage/minion-verification/matrix-stage7/artifacts"
+# The Stage-7 parity doc in the vault: S7-A4 asserts it exists, and the Stage-7
+# run passed it in as VAULT_ARTIFACT. Re-executing S7 without it would fail the
+# check on a missing environment variable, not on a missing artifact.
+S7_VAULT = ("/srv/storage/obsidian/diagnostics-vault/Projects/"
+            "THE MATRIX \u2014 Stage 7 Data Lifecycle, Performance and Parity (2026-10-31).md")
 PREFIX = "/home/main/the-matrix"
 BUILD = "~/matrix-build"
 UNIT_C = "matrix-collect.service"
@@ -245,25 +251,43 @@ def test_a1():
     # --- the S7 suite, re-executed here. Its live checks (A1/A6/A7/A8) run for
     # real against this session's state; A2/A3/A5 re-verify the Stage-7 evidence
     # artifacts (the 62-minute soak body is not re-run -- see HARNESS-NOTES).
+    # Two harness bugs fixed here: the suite was invoked *over ssh* with a local
+    # path (so it never ran: `cd /srv/...` on main fails), and results7.json was
+    # pre-seeded with the S6 result file, so a suite that never ran still looked
+    # 10/10 green. It now runs on this host, from a clean results7.json, with the
+    # VAULT_ARTIFACT the Stage-7 run used (S7-A4 asserts that file exists), and
+    # the check requires all eight S7 names to be present.
     s7 = os.path.join(ART, "s7")
+    if os.path.isdir(s7):
+        shutil.rmtree(s7)
     subprocess.run(f"rsync -a --exclude __pycache__ {PRIOR7}/ {s7}/", shell=True, check=True)
     subprocess.run(f"cp {prior}/s3/results.json {s7}/s3/results.json && "
                    f"cp {prior}/s4/results.json {s7}/s4/results.json && "
                    f"cp {prior}/s5/results.json {s7}/s5/results.json && "
-                   f"cp {prior}/results.json {s7}/results.json && "
-                   f"cp {s7}/results.json {s7}/results7.json", shell=True, check=True)
+                   f"cp {prior}/results.json {s7}/results.json", shell=True, check=True)
+    try:
+        os.remove(f"{s7}/results7.json")
+    except OSError:
+        pass
     stamp = open(STAMP_PATH).read().strip()
     open(f"{s7}/session-start.txt", "w").write(stamp + "\n")
-    r = ssh(f"cd {s7} && STAGE7_ART={s7} python3 run_tests7.py all 2>&1", timeout=1800)
-    t["s7_log_tail"] = r["out"][-1500:]
+    env7 = dict(os.environ, STAGE7_ART=s7, VAULT_ARTIFACT=S7_VAULT)
+    r7 = subprocess.run([sys.executable, "run_tests7.py", "all"], cwd=s7, env=env7,
+                        capture_output=True, text=True, timeout=3600)
+    t["s7_rc"] = r7.returncode
+    t["s7_log_tail"] = (r7.stdout + r7.stderr)[-1500:]
+    t["s7_vault"] = S7_VAULT
     try:
         d7 = json.load(open(f"{s7}/results7.json"))
     except Exception:
         d7 = {}
     c7 = d7.get("checks") or []
+    names7 = [c["name"] for c in c7]
+    missing7 = [f"S7-A{i}" for i in range(1, 9) if f"S7-A{i}" not in names7]
     t["s7"] = {"n": len(c7), "failed": [c["name"] for c in c7 if not c.get("ok")],
-               "names": [c["name"] for c in c7]}
-    t["s7_ok"] = len(c7) >= 8 and not t["s7"]["failed"]
+               "names": names7, "missing": missing7}
+    t["s7_ok"] = (r7.returncode == 0 and len(c7) >= 8 and not t["s7"]["failed"]
+                  and not missing7)
     t["soak_note"] = "S7-A2/A3/A5 read the Stage-7 evidence artifacts; A1/A6/A7/A8 executed live"
 
     ok = (t["build_ok"] and t["warning_count"] == 0 and t["installed_equals_built"]
@@ -553,26 +577,48 @@ def test_a4():
     }
     sha0 = out(f"sha256sum {PREFIX}/bin/matrix-*")
 
-    # --- 1. rollback to the pair saved by the last deploy (older app build)
-    # Pick the newest previous pair that is actually DIFFERENT from what is
-    # installed now (a re-run of this check creates a same-version snapshot).
-    cur = dict((l.split()[1].split("/")[-1], l.split()[0]) for l in sha0.splitlines() if l.strip())
-    cands = [x for x in out(f"ls -1d {PREFIX}/bin/prev/*/").split() if x]
+    # --- 1. upgrade: build the SAME committed tree in a second directory (the
+    # bytes differ -- Rust embeds the build path -- the flags do not) and deploy
+    # it over the live pair. This is also what creates the prev/ snapshot the
+    # rollback below restores, with the unit files that pair was running under.
+    r = ssh(f"{BUILD}/deploy/deploy.sh --from local --src {BUILD} --work {PREFIX}/build "
+            f"--prefix {PREFIX} --unit-prefix matrix --build --auto-rollback 2>&1", timeout=1800)
+    t["deploy"] = {"rc": r["rc"], "out": r["out"][-1200:]}
+    h = health(40)
+    t["deploy_health"] = h.get("ok")
+    new_sha = out(f"sha256sum {PREFIX}/bin/matrix-*")
+    # A rebuild in a different directory is not byte-identical, so the honest
+    # assertion is: the deployed pair IS the pair the deploy just built, and it
+    # differs from the pair that was installed before.
+    build_sha = out(f"sha256sum {PREFIX}/build/target/release/matrix-*")
+    t["deploy_pair"] = {"installed": new_sha, "just_built": build_sha}
+    t["deploy_sha_changed"] = new_sha != sha0 and new_sha == build_sha
+    sha0_map = dict((l.split()[1].split("/")[-1], l.split()[0]) for l in sha0.splitlines() if l.strip())
+    cands = [x.rstrip("/") for x in out(f"ls -1d {PREFIX}/bin/prev/*/").split() if x]
     prev = ""
     for c in sorted(cands, reverse=True):
         try:
             m = json.loads(out(f"cat {c}/manifest.json"))
         except Exception:
             continue
-        if m.get("old_app_sha") != cur.get("matrix-app") or m.get("old_collect_sha") != cur.get("matrix-collect"):
+        if (m.get("old_collect_sha") == sha0_map.get("matrix-collect")
+                and m.get("old_app_sha") == sha0_map.get("matrix-app")):
             prev = c
             break
     t["prev_candidates"] = cands
     t["prev_chosen"] = prev
+    t["prev_units_saved"] = (json.loads(out(f"cat {prev}/manifest.json")).get("units_saved")
+                             if prev else [])
+
+    # --- 2. rollback to the pair that was just replaced (binaries + its units)
     r = ssh(f"{BUILD}/deploy/rollback.sh --prefix {PREFIX} --unit-prefix matrix --to {prev} 2>&1", timeout=300)
     t["rollback"] = {"rc": r["rc"], "out": r["out"][-600:], "prev": prev,
                      "sha": out(f"sha256sum {PREFIX}/bin/matrix-*")}
-    h = health(40)
+    try:
+        t["rollback_json"] = json.loads(r["out"].strip().splitlines()[-1])
+    except Exception:
+        t["rollback_json"] = {}
+    h = health(45)
     t["rollback_health"] = h.get("ok")
     prev_sha_c = out(f"sha256sum {PREFIX}/bin/matrix-collect | cut -d' ' -f1")
     prev_sha_a = out(f"sha256sum {PREFIX}/bin/matrix-app | cut -d' ' -f1")
@@ -580,24 +626,11 @@ def test_a4():
     t["rollback_manifest"] = manifest
     t["rollback_sha_match_manifest"] = (
         prev_sha_c == manifest["old_collect_sha"] and prev_sha_a == manifest["old_app_sha"])
+    t["rollback_units_restored"] = bool(t["rollback_json"].get("units_restored"))
+    t["rollback_exec_has_cap"] = "--max-db-mb" in out(f"systemctl --user show {UNIT_C} -p ExecStart --value")
 
-    # --- 2. upgrade back to the current build (the deploy path)
-    # --build on purpose: the deploy must rebuild from THIS tree, never trust a
-    # stale target/ that predates the retention change
-    r = ssh(f"{BUILD}/deploy/deploy.sh --from local --src {BUILD} --work {PREFIX}/build "
-            f"--prefix {PREFIX} --unit-prefix matrix --build --auto-rollback 2>&1", timeout=1800)
-    t["deploy"] = {"rc": r["rc"], "out": r["out"][-1200:]}
-    h = health(40)
-    t["deploy_health"] = h.get("ok")
-    new_sha = out(f"sha256sum {PREFIX}/bin/matrix-*")
-    # A rebuild in a different directory is not byte-identical (Rust embeds source
-    # paths), so the honest assertion is: the deployed pair IS the pair the deploy
-    # just built, and it differs from the rolled-back pair.
-    build_sha = out(f"sha256sum {PREFIX}/build/target/release/matrix-*")
-    t["deploy_pair"] = {"installed": new_sha, "just_built": build_sha}
-    t["deploy_sha_changed"] = new_sha != t["rollback"]["sha"] and new_sha == build_sha
-    # Normalise back to the reference build in ~/matrix-build so that the later
-    # rebuild (S8-A1) compares like with like: same tree, same flags, same paths.
+    # --- 3. normalise back to the reference build in ~/matrix-build so that the
+    # later rebuild (S8-A1) compares like with like: same tree, flags and paths.
     r = ssh(f"{BUILD}/deploy/install.sh --bin-src {BUILD}/target/release --prefix {PREFIX} "
             f"--unit-prefix matrix 2>&1 | tail -1", timeout=300)
     t["normalized"] = {"rc": r["rc"], "sha": out(f"sha256sum {PREFIX}/bin/matrix-*")}
@@ -606,11 +639,13 @@ def test_a4():
     t["normalized_health"] = h.get("ok")
     t["deploy_log_tail"] = out(f"tail -3 {PREFIX}/etc/deploy-log.jsonl")
 
-    # --- 3. throwaway target: install old pair, upgrade, roll back, uninstall
+    # --- 4. throwaway target: install the reference pair, upgrade, roll back,
+    # rotate, uninstall, purge. (Started from the reference pair rather than the
+    # Stage-5 snapshot: a pre-Stage-8 collector cannot parse the Stage-8 unit's
+    # --max-db-mb, which is the real incompatibility documented in HARNESS-NOTES.)
     TGT = "/home/main/matrix-tgt"
-    oldb = prev
-    r = ssh(f"{BUILD}/deploy/install.sh --prefix {TGT} --unit-prefix matrixtgt --bin-src {oldb} "
-            f"--no-app --no-start 2>&1", timeout=180)
+    r = ssh(f"{BUILD}/deploy/install.sh --prefix {TGT} --unit-prefix matrixtgt "
+            f"--bin-src {BUILD}/target/release --no-app --no-start 2>&1", timeout=180)
     t["tgt_install"] = {"rc": r["rc"], "out": r["out"][-500:],
                         "enabled": out("systemctl --user is-enabled matrixtgt-collect.service"),
                         "active": out("systemctl --user is-active matrixtgt-collect.service")}
@@ -674,6 +709,7 @@ def test_a4():
     t["live_health_close_a4"] = health(40).get("ok")
 
     ok = (t["rollback"]["rc"] == 0 and t["rollback_health"] and t["rollback_sha_match_manifest"]
+          and t["rollback_units_restored"] and bool(t["prev_units_saved"])
           and t["deploy"]["rc"] == 0 and t["deploy_health"] and t["deploy_sha_changed"]
           and t["normalized_matches_reference"] and t["normalized_health"]
           and t["tgt_install"]["rc"] == 0 and "active" in t["tgt_start"]
@@ -683,10 +719,16 @@ def test_a4():
           and t["live_untouched"] and t["live_health_close_a4"])
     save("deploy.json", t)
     check("S8-A4", ok, json.dumps({
+        "upgrade": {"rc": t["deploy"]["rc"], "health": t["deploy_health"],
+                    "sha_changed": t["deploy_sha_changed"],
+                    "installed_is_built": t["deploy_pair"]["installed"] == t["deploy_pair"]["just_built"]},
         "rollback": {"rc": t["rollback"]["rc"], "health": t["rollback_health"],
-                     "sha_match_manifest": t["rollback_sha_match_manifest"]},
-        "deploy": {"rc": t["deploy"]["rc"], "health": t["deploy_health"],
-                   "sha_changed": t["deploy_sha_changed"]},
+                     "sha_match_manifest": t["rollback_sha_match_manifest"],
+                     "units_saved": t["prev_units_saved"],
+                     "units_restored": t["rollback_json"].get("units_restored"),
+                     "exec_still_has_cap": t["rollback_exec_has_cap"]},
+        "normalized": {"matches_reference": t["normalized_matches_reference"],
+                       "health": t["normalized_health"]},
         "throwaway": {"install_rc": t["tgt_install"]["rc"], "start": t["tgt_start"],
                       "upgrade_changed_sha": t["tgt_upgrade_changed_sha"],
                       "rollback_restores": t["tgt_rollback_restores"],
