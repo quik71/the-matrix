@@ -35,6 +35,7 @@ import time
 ART = os.environ.get("STAGE8_ART", "/srv/storage/minion-verification/matrix-stage8/artifacts")
 REPO = "/srv/storage/work/the-matrix"
 PRIOR7 = "/srv/storage/minion-verification/matrix-stage7/artifacts"
+PRIOR6 = "/srv/storage/minion-verification/matrix-stage6/artifacts"
 # The Stage-7 parity doc in the vault: S7-A4 asserts it exists, and the Stage-7
 # run passed it in as VAULT_ARTIFACT. Re-executing S7 without it would fail the
 # check on a missing environment variable, not on a missing artifact.
@@ -200,6 +201,10 @@ def test_a1():
     subprocess.run(f"rsync -a --exclude __pycache__ --exclude session-start.txt "
                    f"{PRIOR7}/s3 {PRIOR7}/s4 {PRIOR7}/s5 "
                    f"{PRIOR7}/run_tests6.py {PRIOR7}/results.json {prior}/", shell=True, check=True)
+    # S6-A6's artifacts-convention check requires this suite's OWN packet builder
+    # beside it (stage-6 original, same suite schema). 4/4 red on 2026-11-01 was
+    # this file's absence, not the product.
+    subprocess.run(f"rsync -a {PRIOR6}/make_packet.py {prior}/", shell=True, check=True)
     # fixtures the S5 harness imports from the S3 run
     os.makedirs(f"{prior}/s5/stage3", exist_ok=True)
     os.makedirs(f"{prior}/s4/stage3", exist_ok=True)
