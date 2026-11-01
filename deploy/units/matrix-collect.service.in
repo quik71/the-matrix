@@ -1,0 +1,38 @@
+[Unit]
+Description=THE MATRIX telemetry collector (@UNIT_PREFIX@: routing trace -> NDJSON + SQLite)
+Documentation=file://@PREFIX@/OPS-RUNBOOK.md
+# The engine is its own user unit and may be restarted independently; the
+# collector must never be ordered *before* it (it only reads /metrics and the
+# trace file, which it tolerates being absent), but it should come up with the
+# user session and it must survive its own crashes.
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=@PREFIX@
+ExecStart=@PREFIX@/bin/matrix-collect --path @TRACE@ --socket @SOCKET@ --db @DB@ --engine @ENGINE@ --engine-conf @ENGINE_CONF@
+# kill -9 and any non-zero exit are failures and must be repaired by the unit.
+Restart=on-failure
+RestartSec=2
+# A clean SIGTERM must be allowed to finish the tail flush and the WAL close.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+KillMode=mixed
+# NB: per-unit log rate limiting is NOT available for *user* units
+# (systemd.exec(5): "only available for system services, not in per-user
+# services"; the [Service] RateLimit*= keys were removed in systemd 262).
+# The bound is therefore the journald size/file/rotation caps installed by
+# deploy/journald-caps.sh (SystemMaxUse=512M, SystemMaxFileSize=64M,
+# MaxFileSec=1day) plus this unit's deliberately small log volume (measured in
+# the Stage-8 packet, log-bounds.json).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=@UNIT_PREFIX@-collect
+Environment=RUST_BACKTRACE=1
+Environment=RUST_LOG=warn
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,35 @@
+[Unit]
+Description=THE MATRIX viewer (@UNIT_PREFIX@: wgpu window on the Hyprland session)
+Documentation=file://@PREFIX@/OPS-RUNBOOK.md
+# Autostart path: a *user* unit bound to graphical-session.target.
+# uwsm (sddm autologin -> `uwsm start Hyprland`) imports the compositor
+# environment into the systemd user manager (WAYLAND_DISPLAY, XDG_RUNTIME_DIR,
+# HYPRLAND_INSTANCE_SIGNATURE) and then starts graphical-session.target, so a
+# unit wanted by that target inherits a working Wayland env *and* gets a
+# restart policy and a journal. Hyprland's exec-once cannot do either.
+After=graphical-session.target
+Wants=matrix-collect.service
+After=matrix-collect.service
+PartOf=graphical-session.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=@PREFIX@
+ExecStart=@PREFIX@/bin/matrix-app --socket @SOCKET@ --stats @STATS@ --rain @RAIN@ --view @VIEW@ --monitor @MONITOR@ @EXTRA_ARGS@
+# `esc` is a clean exit (status 0) and stays stopped; kill -9 / a crash is a
+# failure and the unit restarts the window.
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=10
+# See matrix-collect.service.in: per-unit rate limits do not exist for user
+# units; journald caps + a small log volume are the bound.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=@UNIT_PREFIX@-app
+Environment=RUST_BACKTRACE=1
+
+[Install]
+WantedBy=graphical-session.target

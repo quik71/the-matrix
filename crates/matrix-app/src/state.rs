@@ -273,6 +273,9 @@ pub struct State {
     pub connect_wall: f64, // wall clock of the connect currently in effect
     pub last_disconnect_reason: String,
     pub reconnects_with_replay: u64,
+    // `connects` value for which reconnects_with_replay was last incremented,
+    // so a reconnect that is replayed counts exactly once.
+    pub replay_counted_connect: u64,
 
     // meta
     pub model: Option<String>,
@@ -452,6 +455,7 @@ impl State {
             connect_wall: 0.0,
             last_disconnect_reason: String::new(),
             reconnects_with_replay: 0,
+            replay_counted_connect: 0,
             model: None,
             collector_version: None,
             schema: None,
@@ -1329,6 +1333,15 @@ impl State {
                         s.sub_replay_truncated = e.truncated;
                         s.sub_bytes_out = e.bytes_out;
                         self.replay_seen = e.replayed as u64;
+                        // A replay that belongs to a *reconnect* (not the first
+                        // attach) is the thing operators care about: the app
+                        // lost the socket, came back, and the collector filled
+                        // the hole from its store. Count it once per connect.
+                        if e.replayed > 0 && self.connects > 1
+                            && self.replay_counted_connect != self.connects {
+                            self.reconnects_with_replay += 1;
+                            self.replay_counted_connect = self.connects;
+                        }
                         if e.truncated > 0 {
                             self.replay_truncated_seen = e.truncated as u64;
                         }
