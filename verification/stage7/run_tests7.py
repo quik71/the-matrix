@@ -265,18 +265,23 @@ def test_a5():
     t["vram_cells"] = len(ev.get("vram_cells") or [])
     t["tiers"] = ev.get("tiers")
     # independent check of the estimate against the profile on disk
+    # (real newlines in the -c payload: the previous version escaped them one level
+    # too far, so python received a literal backslash-n, exited non-zero and the
+    # check passed on an EMPTY sample -- prof was "" and "bad" not in "" is True.)
     prof_code = (
-        "import struct\\n"
-        f"b=open({PROFILE!r},'rb').read()\\n"
-        "mig,ver,lay,exp,want,n=struct.unpack('<4sIIIII', b[:24])\\n"
-        "pairs=[struct.unpack('<HH', b[24+i*4:28+i*4]) for i in range(n)]\\n"
-        f"bad=[p for p in pairs[:{int(ev.get('slots') or 0)}] if p[0]>=lay or p[1]>=exp]\\n"
-        "print(len(pairs), lay, exp, ('BAD' if bad else 'ok'))\\n"
+        "import struct\n"
+        f"b=open({PROFILE!r},'rb').read()\n"
+        "mig,ver,lay,exp,want,n=struct.unpack('<4sIIIII', b[:24])\n"
+        "pairs=[struct.unpack('<HH', b[24+i*4:28+i*4]) for i in range(n)]\n"
+        f"bad=[p for p in pairs[:{int(ev.get('slots') or 0)}] if p[0]>=lay or p[1]>=exp]\n"
+        "print(len(pairs), lay, exp, ('BAD' if bad else 'ok'))\n"
     )
     prof = out(f"python3 -c {shlex.quote(prof_code)}")
     t["profile_check"] = prof
     t["profile_pairs"], t["profile_layers"], t["profile_experts"] = (
         (prof.split() + ["", "", ""])[:3] if prof else ("", "", ""))
+    # the independent check counts only when it actually ran and reported ok
+    prof_ok = bool(prof) and prof.split()[-1] == "ok" and int((prof.split() + ["0"])[0] or 0) > 0
     # analysis.json carries the sample COUNT, not the samples; the per-sample
     # residency the app painted lives in soak.json (falling back to samples.jsonl)
     samp = (load("soak.json") or {}).get("samples") or []
@@ -291,10 +296,12 @@ def test_a5():
           and t["vram_cells"] == t["slots"] and t["vram_cells"] > 0
           and (t["tiers"] or {}).get("ssd") == 0
           and t["app_painted_cells"] == t["vram_cells"]
-          and "bad" not in prof)
+          and prof_ok)
     check("S7-A5", ok, json.dumps({k: t[k] for k in ("status", "basis", "confirmed", "policy", "slots",
                                                      "vram_cells", "tiers", "app_painted_cells",
-                                                     "profile_pairs", "profile_layers", "profile_experts")}))
+                                                     "profile_pairs", "profile_layers", "profile_experts")}
+                                  | {"profile_ok": prof_ok, "profile_check": prof,
+                                     "painted_samples": t.get("app_painted_samples")}))
     return t
 
 
