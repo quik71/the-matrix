@@ -245,7 +245,7 @@ change for it to go green once the session is unlocked.
 | S8-A5 | PASS | `log-bounds.json`: caps 512M/64M/KeepFree 4G/daily/14-day applied, `under_cap:true`, rotation observed (38→40 files), unit volume 22.7 MB/day over a fixed 3 h window, rate limiting reported unsupported for user units with the man-page sentence, expiry 293 562 → 51 events / 181.4 MB → 0.44 MB with integrity ok and a replay floor, size cap evicted 240 731 events until it fit, export identity held |
 | S8-A6 | PASS | `runbook.json`: repo/host/vault present, 10 sections, snapshot `0.19 s -> 0.18 GB` at 293 584 events (identical counts at the watermark), restore round-trip ok, 9 documented commands all rc 0, arithmetic `618 B/event` vs `~630` and `293 B/line` vs `~290`, `db-rotate --check` reports honestly |
 | S8-A7 | PASS | `engine-fingerprint.json`: MainPID 996095, NRestarts 0, ActiveEnterTimestamp unchanged, config mtime 1793410092 + sha `62368d5e…`, inventory 7900 files + sha `145050f6…`; repo clean, zero remotes, deploy/ + verification/stage8 tracked |
-| S8-A8 | blocked with A1 | `final-health.json`: live pair healthy at close (connected, meta over socket, painted 2675, forced 0); packet complete except the A1 claim |
+| S8-A8 | blocked with A1 | `final-health.json`: live pair healthy at close (`ok:true, connected:true, meta_source:socket, painted 2675 == slots, forced_ours 0`). The packet holds all eight claims; `complete` is false because S8-A1 is false, and the only artifact paths it cannot resolve are the two that a completed chain would write (`a1.json`, `s7/results7.json`) — the honest record of the block |
 
 ## 5. Where the artifacts are
 
