@@ -17,7 +17,7 @@ StartLimitBurst=30
 [Service]
 Type=simple
 WorkingDirectory=@PREFIX@
-ExecStart=@PREFIX@/bin/matrix-app --socket @SOCKET@ --stats @STATS@ --rain @RAIN@ --view @VIEW@ --monitor @MONITOR@ @EXTRA_ARGS@
+ExecStart=@PREFIX@/bin/matrix-app --socket @SOCKET@ --stats @STATS@ --rain @RAIN@ --view @VIEW@ --monitor @MONITOR@ --meta-db @DB@ @EXTRA_ARGS@
 # `esc` is a clean exit (status 0) and stays stopped; kill -9 / a crash is a
 # failure and the unit restarts the window.
 Restart=on-failure

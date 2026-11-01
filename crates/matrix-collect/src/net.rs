@@ -242,7 +242,17 @@ pub fn serve(mut stream: UnixStream, sub: Arc<Sub>, stop: Arc<AtomicBool>) {
                 break p;
             }
             let _ = cv.wait_timeout(g, Duration::from_millis(100));
-            if t0.elapsed() > Duration::from_secs(10) {
+            if t0.elapsed() > Duration::from_secs(30) {
+                // ROOT CAUSE of the 2026-11-01 22:52 "connected but meta-less"
+                // incident: a cold cache + huge window made the producer's tail
+                // query exceed the old 10 s; the connection continued with an
+                // EMPTY preload — no meta, no residency, no gaps — and the
+                // completion log is skipped for empty preloads, so the journal
+                // showed nothing. Now: longer patience, and the give-up is LOUD.
+                eprintln!(
+                    "subscriber {}: preload NOT READY within 30 s (store busy/cold) — continuing live; meta may be absent from this stream",
+                    sub.name
+                );
                 break Preload {
                     lines: Vec::new(),
                     floor: 0,
