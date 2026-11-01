@@ -1327,8 +1327,16 @@ def test_a8():
     ids = [c.get("id") for c in claims]
     want = [f"S8-A{i}" for i in range(1, 9)]
     paths = sorted({x for c in claims for x in (c.get("artifact_paths") or [])})
+    # S8-A8 must not gate on its own prior result: this check runs
+    # BEFORE its own outcome is written, so including its id in the
+    # failed list made it permanently self-contradictory (the stage 7
+    # sibling bug: "packet builder citing its own results as evidence").
+    # It verifies the other 7 claims + its own live conditions directly;
+    # the final packet is rebuilt after this gate closes, and will
+    # legitimately carry A8's true result. (2026-11-01, root-caused)
     t.update({"ids": ids, "missing": [i for i in want if i not in ids],
-              "failed": [c["id"] for c in claims if not c.get("ok")],
+              "failed": [c["id"] for c in claims
+                         if not c.get("ok") and c["id"] != "S8-A8"],
               "paths": len(paths), "paths_missing": [x for x in paths if not os.path.exists(x)],
               "acceptance": pk.get("acceptance_criteria")})
     h = health(60)
@@ -1339,9 +1347,12 @@ def test_a8():
     ok = (r.returncode == 0 and not t["missing"] and not t["failed"] and not t["paths_missing"]
           and bool(t["acceptance"]) and h.get("ok") and h.get("residency_painted") == 2675
           and h.get("connected") and h.get("forced_ours") == 0)
-    check("S8-A8", ok, json.dumps({"claims": len(claims), "missing": t["missing"],
+    check("S8-A8", ok, json.dumps({"builder_output": t["make_out"],
+                                   "claims": len(claims), "missing": t["missing"],
                                    "failed": t["failed"], "paths": t["paths"],
                                    "paths_missing": t["paths_missing"][:5],
+                                   "make_rc": t["make_rc"],
+                                   "acceptance_count": len(t["acceptance"] or []),
                                    "live": t["live_close"]}))
     return t
 

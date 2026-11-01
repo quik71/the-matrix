@@ -293,3 +293,30 @@ attempt. In this run S5 failed 2/4 and S6 failed 2/4 with the failed-check
 names destroyed on retry — a suite that goes red twice then green is only
 "green" if someone can still say what it was red on. (The earlier 4/4-then-
 3/10 chain restarts had the same amnesia.)
+
+## 2026-11-01 late — the self-reference family, twice in one night (A8)
+
+After the first fully green chain (22:52), A8 stayed red and stayed red for
+three more investigations:
+
+1. **Real finding first:** the live pair's counters carried 571 forced drops
+   from the chain itself — four suites hammering the engine simultaneously for
+   45 min (628k events). Bounded-queue law working as designed: drops counted,
+   never silent. Recorded as a capacity observation (0.09% under absurd
+   synthetic pile-up); deploy-time health gates measure fresh instances, as
+   always.
+2. **A8's contract is "the packet is complete" — and the packet contained
+   A8's own verdict.** A file cannot carry proof of its own completeness: the
+   builder included S8-A8 in its completeness computation, and the check
+   included itself in the failed list — a permanent loop. Both surfaces fixed
+   with explicit comments; all other claims, all paths, and live health are
+   still required in full. (Stage 7's packet carried the same bug class:
+   "packet builder citing its own results as evidence".)
+3. **A third copy of the builder.** test_a8 EXECUTES `$ART/make_packet.py`
+   (artifacts root); A6 only checks existence at `prior/`. I patched the repo
+   and prior/, and the run kept using the artifacts-root copy — same-named
+   files, three homes, the runner always uses the one you didn't touch. All
+   three now verified by content hash before re-run (7fb9629825a7 on all).
+
+Law for the next harness: any file a suite *executes* must be hashed and
+verified at the executed path, not just copied and hoped for.
