@@ -931,57 +931,70 @@ fn wm_fullscreen_toggle() {
     eprintln!("wm-fullscreen: gave up; window stays as the compositor left it");
 }
 
-/// Read the collector's recorded `meta` line back from its own SQLite store.
-/// Fallback only: the collector now replays its stored meta to every subscriber
-/// at connect, so this is used only when --meta-db is given and the socket never
-/// delivered one. Read-only, one row.
+/// Newest recorded row of a given kind, as one string. Read-only.
+fn db_line(db: &str, kind: &str) -> Option<String> {
+    let out = std::process::Command::new("sqlite3")
+        .args(["-json", db, &format!(
+            "SELECT line FROM events WHERE kind='{kind}' ORDER BY seq DESC LIMIT 1")])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        eprintln!("meta-db: query failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        return None;
+    }
+    let list = json::parse(&out.stdout).ok()?;
+    match list {
+        json::Value::Arr(a) => a
+            .first()
+            .and_then(|r| r.get("line"))
+            .and_then(|l| l.as_str())
+            .map(|s| s.to_string()),
+        _ => None,
+    }
+}
+
+/// BACKSTOP: read the collector's recorded rows from its own SQLite store.
+/// Fallback only: the collector normally replays meta + residency to every
+/// subscriber at connect; this runs only when --meta-db is given and the
+/// socket has not delivered them.
+///
+/// Complete, not partial (2026-11-01): the first version backfilled meta and
+/// stopped — but residency is its OWN row kind, so a cold connection whose
+/// preload missed patience still painted a model name over an empty lattice
+/// (observed live: resid 0 while model shown). Each field is now checked and
+/// fetched separately, and the residency row goes through State::apply — the
+/// exact live handler, so there is no second parsing path to drift. The
+/// estimate derives from the model profile, not a run, so the latest recorded
+/// row is the same estimate.
 fn meta_backfill(db: String, st: Arc<Mutex<State>>) {
     for attempt in 1..=6 {
         std::thread::sleep(Duration::from_millis(500));
-        let have = {
+        let (need_meta, need_res) = {
             let s = st.lock().unwrap_or_else(|p| p.into_inner());
-            s.model.is_some()
+            (s.model.is_none(), s.residency.is_none())
         };
-        if have {
+        if !need_meta && !need_res {
             return;
         }
         if !std::path::Path::new(&db).exists() {
             continue;
         }
-        let out = std::process::Command::new("sqlite3")
-            .args(["-json", &db, "SELECT line FROM events WHERE kind='meta' ORDER BY seq DESC LIMIT 1"])
-            .output();
-        let Ok(out) = out else {
-            eprintln!("meta-db: sqlite3 unavailable");
-            return;
-        };
-        if !out.status.success() {
-            eprintln!("meta-db: query failed: {}", String::from_utf8_lossy(&out.stderr).trim());
-            continue;
+        if need_meta {
+            if let Some(l) = db_line(&db, "meta") {
+                let mut s = st.lock().unwrap_or_else(|p| p.into_inner());
+                if s.backfill_meta(&l, "collector-store") {
+                    eprintln!("meta-db: model {:?} from the collector's recorded meta row", s.model);
+                }
+            } else {
+                eprintln!("meta-db: no meta row yet (attempt {attempt})");
+            }
         }
-        let list = match json::parse(&out.stdout) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("meta-db: parse {e}");
-                continue;
+        if need_res {
+            if let Some(l) = db_line(&db, "residency_estimate") {
+                let mut s = st.lock().unwrap_or_else(|p| p.into_inner());
+                s.apply(&l);
+                eprintln!("meta-db: residency backfilled from the recorded estimate row");
             }
-        };
-        let line = match list {
-            json::Value::Arr(a) => a
-                .first()
-                .and_then(|r| r.get("line"))
-                .and_then(|l| l.as_str())
-                .map(|s| s.to_string()),
-            _ => None,
-        };
-        if let Some(l) = line {
-            let mut s = st.lock().unwrap_or_else(|p| p.into_inner());
-            if s.backfill_meta(&l, "collector-store") {
-                eprintln!("meta-db: model {:?} from the collector's recorded meta row", s.model);
-                return;
-            }
-        } else {
-            eprintln!("meta-db: no meta row yet (attempt {attempt})");
         }
     }
 }
