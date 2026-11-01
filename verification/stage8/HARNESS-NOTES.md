@@ -146,6 +146,32 @@ figure was also re-measured: `0.19 s -> 0.18 GB` at 293 584 events, replacing
 "20.2 GB/day" extreme-duty rate and the `20–35 GB` one-day ceiling are unchanged
 because their measurement has not changed.
 
+### 2.7 S4-A5 could pass while the session was locked (unknown probe read as "unlocked")
+
+`session_locked()` maps the `omarchy-shell lock isLocked` call to
+`True`/`False`/`None`, and A5 did `locked = bool(t.get("locked_during_a"))` — so
+a probe that returned nothing (shell restarting, IPC failure) became **"not
+locked"**. That happened in this session: S4 reported 10/10 while
+`omarchy-shell lock status` said `locked:true` and a DP-1 capture of the running
+app had `green_frac 0.000`. A check that passes when its probe fails is worth
+less than no check.
+
+Fixed in the copies: the `None` case is documented as "unknown", and A5 now
+requires `locked_during_a is False` (an unknown state is not a valid
+"rain animating" window either). After the fix the same run reports
+`locked_during_a: true` and fails A5 — which is the truth about this machine
+right now.
+
+### 2.8 S4-A3's window can lose a foreign request at the boundary (left strict)
+
+One attempt failed with `gens 10, engine_delta 10, app_delta 11, db_delta 11,
+identity false, pre_window []`: a session was created just after the baseline
+was read while its engine counter increment had already been counted in the
+baseline. That is the mirror image of the Stage-7 fix (§4 of the Stage-7 notes),
+and it is a sub-second race on a shared engine, not a collector defect —
+`app_delta == db_delta` held and every session decoded. Left strict; the retry
+run reported `identity true` with `engine_delta == app_delta == db_delta == 10`.
+
 ## 3. What is blocked, and why (S8-A1)
 
 The graphical session on main is at a **real password lock**:
@@ -168,11 +194,11 @@ session, and no password was available or sought.
 Consequences, measured:
 
 * `S4-A5` fails on its `not locked` conjunct — and on nothing else. The window
-  it rejected was valid on its own terms: `cpu_pct 3.826`, `60.08 fps`,
-  `3612 frames / 60.12 s` with rain on, `cpu_pct 0.383`, `0 frames`,
-  `frames_spurious 0` with rain off. The guard exists because a locked session
-  *can* withhold presents; here it demonstrably did not, but the guard is a
-  Stage-4 decision and was left as it is.
+  it rejected was valid on its own terms: `cpu_pct 3.426`, `60.29 fps`,
+  `3625 frames / 60.13 s` with rain on, `cpu_pct 0.382`, `0 frames`,
+  `frames_spurious 0` with rain off, `locked_during_a: true`. The guard exists
+  because a locked session *can* withhold presents; here it demonstrably did
+  not, but the guard is a Stage-4 decision and was left as it is.
 * `S5` and `S6` screenshot checks capture the lock surface, so their pixel
   census has nothing to measure (green_frac 0.000 on the same monitor). They
   cannot pass while the console is locked, and the chain stops at the first
@@ -180,9 +206,11 @@ Consequences, measured:
 
 What was proven before the block, with the same binaries that are deployed:
 
-* `S3` **10/10 on attempt 1** (`chain-blocked/s3-results.json`), including the
-  crash/gap-tiling check and the read-only-trace proof;
-* `S4` **9/10** (`chain-blocked/s4-results.json`): the only failure is
+* `S3` **10/10 on attempt 1** (`chain-blocked/s3-attempt1.json`), including the
+  crash/gap-tiling check, the read-only-trace proof and the retention check
+  (`--retention-days 0`: routing 1200 -> 1200, passes 8 -> 8, retention line
+  present);
+* `S4` **9/10** (`chain-blocked/s4-retry.json`): the only failure is
   `S4-A5`/`not locked` above; `S4-A1` (documented-deleting allow-list) is green
   after registering this stage's three collector commits by subject, with their
   justification, exactly as the mechanism intends — the guard itself is
@@ -210,7 +238,7 @@ change for it to go green once the session is unlocked.
 
 | id | state | evidence |
 |---|---|---|
-| S8-A1 | **blocked** (console lock) | S3 10/10 `chain-blocked/s3-results.json`; S4 9/10 `chain-blocked/s4-results.json` (only `S4-A5`/`not locked`); build `warnings=0 errors=0`; S7 re-executed locally by the fixed leg (§2.1) — not reachable while S4 is red |
+| S8-A1 | **blocked** (console lock) | S3 10/10 `chain-blocked/s3-attempt1.json`; S4 9/10 `chain-blocked/s4-retry.json` (only `S4-A5`/`not locked`); build `warnings=0 errors=0`; S7 re-executed locally by the fixed leg (§2.1) — not reachable while S4 is red |
 | S8-A2 | PASS | `units.json`: enabled/enabled, After/Wants/PartOf as specified, exact ExecStart, `env_inherited:true`, `graphical-session.target` active, 3/3 cycles healthy, painted `[2675,2675,2675]`; boot activation honestly pending |
 | S8-A3 | PASS | `recovery.json`: collector `kill -9` → unit restart 2.2 s, app reconnects with a new `run_id`, replay + `reconnects_with_replay` incremented; app `kill -9` → restart 3.3 s, meta over socket, painted 2675, `run_id` unchanged; fresh subscriber sees `meta` first then replay |
 | S8-A4 | PASS | `deploy.json`: upgrade from the previous compatible release (rc 0, health, installed==just-built, sha changed), rollback to that pair (rc 0, shas == manifest, units restored, health), normalised to the reference build, throwaway install/upgrade/rollback/rotate/uninstall/purge (wrong confirmation refused), live DB same inode and same data-dir listing |
