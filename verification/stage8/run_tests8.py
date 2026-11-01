@@ -192,7 +192,7 @@ def test_a1():
     # waiting to happen; s6 found no prior/session-start.txt and stamped ITSELF,
     # then called its own chain's earlier suites stale — root cause of the
     # 3/3 s6-A1 failures on 2026-11-01). Written once, here, before the chain.
-    stamp_ts = f"{time.time()}\n"
+    stamp_ts = time.strftime("%Y-%m-%dT%H:%M:%S%z") + "\n"  # ISO, matches finished fields
     with open(STAMP_PATH, "w") as fh:
         fh.write(stamp_ts)
     with open(f"{prior}/session-start.txt", "w") as fh:
