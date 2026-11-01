@@ -19,7 +19,8 @@ CLAIMS = {
         "claim": "Zero-warning release rebuild of the workspace, the S3 (10), S4 (10), S5 (9) and S6 (10) suites re-run green in this session from their own harnesses against these binaries, and the S7 suite re-executed in this session (its A1/A6/A7/A8 live, its A2/A3/A5 re-verifying the Stage-7 evidence artifacts; the 62-minute soak body was not re-run).",
         "command": "ssh main 'touch crates/*/src/*.rs && cargo build --release'; python3 run_tests.py all (s3); run_tests4.py all; run_tests5.py all; run_tests6.py all; STAGE7_ART=…/s7 python3 run_tests7.py all",
         "artifacts": ["a1.json", "build.log", "prior/s3/results.json", "prior/s4/results.json",
-                      "prior/s5/results.json", "prior/results.json", "s7/results7.json"],
+                      "prior/s5/results.json", "prior/results.json", "s7/results7.json",
+                      "chain-blocked/s3-results.json", "chain-blocked/s4-results.json"],
     },
     "S8-A2": {
         "claim": "matrix-collect and matrix-app run as enabled systemd *user* units with the proven ExecStart, the proven After= ordering and a Wayland environment inherited from uwsm's graphical-session.target; three stop/start cycles each restore a healthy pair without a reboot. Activation at login is honestly pending.",
@@ -32,12 +33,12 @@ CLAIMS = {
         "artifacts": ["recovery.json", "sub8.py"],
     },
     "S8-A4": {
-        "claim": "Deploy, previous-binary rollback and uninstall were executed for real: the live pair was rolled back to the previous binary pair and re-upgraded through the health gate, and a throwaway prefix was installed, upgraded, rolled back, uninstalled keeping its data, refused a wrong purge confirmation and purged with the exact one. The live database was never written by these scripts (same inode and same data-dir listing before/after).",
-        "command": "deploy/rollback.sh --to <prev>; deploy/deploy.sh --from local --src … --no-build --auto-rollback; install.sh/deploy.sh/rollback.sh/uninstall.sh on ~/matrix-tgt",
+        "claim": "Deploy, previous-binary rollback and uninstall were executed for real: the previous compatible release was put back, the committed build was deployed over it through the health gate (installed pair == the pair just built, sha changed), rolled back to that release with its unit files restored, then normalised to the reference build; and a throwaway prefix was installed, upgraded, rolled back, uninstalled keeping its data, refused a wrong purge confirmation and purged with the exact one. The live database was never written by these scripts (same inode and same data-dir listing before/after).",
+        "command": "install.sh --bin-src <prev-pair>; deploy/deploy.sh --from local --src … --build --auto-rollback; rollback.sh --to <prev>; install.sh --bin-src <reference>; install.sh/deploy.sh/rollback.sh/db-rotate.sh/uninstall.sh on ~/matrix-tgt",
         "artifacts": ["deploy.json"],
     },
     "S8-A5": {
-        "claim": "Logs and runtime state are bounded and measured: journald caps (512M total, 64M per file, daily rotation, 14-day retention) are installed and enforced (733 MB -> 480 MB on restart), rotation observed, the pair's own log volume measured, and per-unit rate limiting tested and reported as unsupported for user units on systemd 262 rather than assumed.",
+        "claim": "Logs and runtime state are bounded and measured: journald caps (512M total, 64M per file, daily rotation, 14-day retention) are installed and enforced (disk usage before/after in the evidence), rotation observed, the pair's own log volume measured over a fixed 3 h window, per-unit rate limiting tested and reported as unsupported for user units (man systemd.exec) rather than assumed; the 1-day retention is a real ceiling proven on a shifted copy (routing/passes/events expire, unfinished sessions survive, integrity ok, replay floor reported), the --max-db-mb cap evicts oldest-first until the file fits, and the live unit advertises both.",
         "command": "deploy/journald-caps.sh install; journalctl --disk-usage; SIGUSR2 rotation; 3000-line LogRateLimit probe; journalctl --user -u … --output=json | wc -c",
         "artifacts": ["log-bounds.json"],
     },

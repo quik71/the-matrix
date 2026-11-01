@@ -106,13 +106,19 @@ systemctl --user start matrix-collect.service
 
 **The documented snapshot command is `VACUUM INTO`.** It writes one consistent
 online copy in a single read transaction and does not contend with the
-collector's writes. Measured on the live database (~2 GB, collector running, 2026-10-31):
+collector's writes. Measured on the live database with the 1-day window armed
+(Stage 8, 2026-11-01, collector running, 8,250 events):
 
 ```
 $ sqlite3 ~/the-matrix/data/telemetry.sqlite "VACUUM INTO '/tmp/telemetry-snap.sqlite'"
-~2 s    ->  ~2.0 GB copy,  pragma integrity_check = ok,  event count identical
-            at the watermark recorded before the copy (3,074,482 == 3,074,482)
+0.01 s   ->  0.005 GB copy,  pragma integrity_check = ok,  event count identical
+             at the watermark recorded before the copy (8,250 == 8,250)
 ```
+
+The store is now a 1-day window (see "How big can the database get?"), so the
+copy is the size of that window: a few MB when idle, up to the 20–35 GB/day
+ceiling under sustained generation. The 2 s / ~2 GB figure this section used to
+carry described the pre-Stage-8 unbounded store.
 
 `sqlite3 .backup` is **not** the documented command here: against the hot WAL
 database the backup API restarts page-by-page whenever the collector commits
@@ -159,7 +165,7 @@ explains restarts and replay floors.
 | duty | measured rate | 1-day ceiling |
 |---|---|---|
 | extreme (Stage-7 soak: 45 tok/s continuous) | 20.2 GB/day measured; 34.8 GB/day with line-cache compaction; 119 GB/day if nothing were compacted | **20–35 GB** |
-| this host's observed day (mixed load, includes the 62-min soak): 3.3 M events, ~1 GB of NDJSON | 1-2 GB on disk (**~320-630 B/event**, depending on how recently it was VACUUM'd) | **1-2 GB** |
+| this store, measured in Stage 8 (1-day window, 8,250 events, 5.2 MB packed incl. routing) | ~630 B/event on disk, ~290 B per NDJSON event line (both measured) | at 3.3 M events/day: 1-2 GB |
 | quiet day | a fraction of the above | < 1 GB |
 
 **The hard bound is `--max-db-mb 25000` (25 GB):** if the 1-day window still

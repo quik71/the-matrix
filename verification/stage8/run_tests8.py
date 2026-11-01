@@ -342,6 +342,13 @@ def test_a2():
                                  "HYPRLAND_INSTANCE_SIGNATURE", "XDG_CURRENT_DESKTOP")}
     tgt_state = out("systemctl --user is-active graphical-session.target")
     t["graphical_session_target"] = tgt_state
+    # This check reads /proc/<MainPID>/environ, so the pair must actually be
+    # running: a suite started while the previous one left the units stopped
+    # reads MainPID=0 and reports env_inherited:false about a stopped process.
+    t["health_at_start"] = health(20).get("ok")
+    if not t["health_at_start"]:
+        start_units()
+        wait_for(lambda: show(UNIT_A, "MainPID").get("MainPID", "0") not in ("", "0"), 30)
     pid = show(UNIT_A, "MainPID").get("MainPID", "0")
     proc_env = out(f"tr '\\0' '\\n' < /proc/{pid}/environ 2>/dev/null")
     penv = dict(l.split("=", 1) for l in proc_env.splitlines() if "=" in l)
@@ -577,40 +584,63 @@ def test_a4():
     }
     sha0 = out(f"sha256sum {PREFIX}/bin/matrix-*")
 
-    # --- 1. upgrade: build the SAME committed tree in a second directory (the
-    # bytes differ -- Rust embeds the build path -- the flags do not) and deploy
-    # it over the live pair. This is also what creates the prev/ snapshot the
-    # rollback below restores, with the unit files that pair was running under.
+    # --- 1. put the previous *compatible* release back on the box, so the
+    # upgrade below is a real one (different bytes over an older release).
+    # "Compatible" is checked, not assumed: the collector must parse the unit's
+    # --max-db-mb. Measured today: rebuilding the same source in another
+    # directory is byte-identical, so a same-source redeploy cannot prove an
+    # upgrade at all -- the predecessor's "different dir => different bytes"
+    # assumption was false and its sha comparison accordingly meaningless.
+    cands = [x.rstrip("/") for x in out(f"ls -1d {PREFIX}/bin/prev/*/").split() if x]
+    t["prev_candidates"] = cands
+    prev_pair = ""
+    for c in sorted(cands, reverse=True):
+        if out(f"{c}/matrix-collect --help 2>&1 | grep -c -- --max-db-mb") not in ("0", ""):
+            if out(f"sha256sum {c}/matrix-collect | cut -d' ' -f1") != out(
+                    f"sha256sum {PREFIX}/bin/matrix-collect | cut -d' ' -f1"):
+                prev_pair = c
+                break
+    t["prev_pair_used"] = prev_pair
+    if prev_pair:
+        r = ssh(f"{BUILD}/deploy/install.sh --bin-src {prev_pair} --prefix {PREFIX} "
+                f"--unit-prefix matrix 2>&1 | tail -1", timeout=300)
+        t["prev_install"] = {"rc": r["rc"], "out": r["out"][-200:]}
+        h = health(45)
+        t["prev_install_health"] = h.get("ok")
+    sha_before = out(f"sha256sum {PREFIX}/bin/matrix-*")
+
+    # --- 2. upgrade: deploy the committed build over that release
     r = ssh(f"{BUILD}/deploy/deploy.sh --from local --src {BUILD} --work {PREFIX}/build "
             f"--prefix {PREFIX} --unit-prefix matrix --build --auto-rollback 2>&1", timeout=1800)
     t["deploy"] = {"rc": r["rc"], "out": r["out"][-1200:]}
     h = health(40)
     t["deploy_health"] = h.get("ok")
     new_sha = out(f"sha256sum {PREFIX}/bin/matrix-*")
-    # A rebuild in a different directory is not byte-identical, so the honest
-    # assertion is: the deployed pair IS the pair the deploy just built, and it
-    # differs from the pair that was installed before.
-    build_sha = out(f"sha256sum {PREFIX}/build/target/release/matrix-*")
-    t["deploy_pair"] = {"installed": new_sha, "just_built": build_sha}
-    t["deploy_sha_changed"] = new_sha != sha0 and new_sha == build_sha
-    sha0_map = dict((l.split()[1].split("/")[-1], l.split()[0]) for l in sha0.splitlines() if l.strip())
-    cands = [x.rstrip("/") for x in out(f"ls -1d {PREFIX}/bin/prev/*/").split() if x]
+    # compare the two binaries by name: `matrix-*` in the build dir also matches
+    # matrix-app.d / matrix-collect.d (the predecessor's glob made this always
+    # false)
+    build_sha = out(f"sha256sum {PREFIX}/build/target/release/matrix-collect "
+                    f"{PREFIX}/build/target/release/matrix-app")
+    t["deploy_pair"] = {"installed": new_sha, "just_built": build_sha,
+                        "named_equal": (sorted(l.split()[0] for l in new_sha.splitlines() if l.strip())
+                                        == sorted(l.split()[0] for l in build_sha.splitlines() if l.strip()))}
+    t["deploy_sha_changed"] = new_sha != sha_before and t["deploy_pair"]["named_equal"]
+    sha_before_map = dict((l.split()[1].split("/")[-1], l.split()[0]) for l in sha_before.splitlines() if l.strip())
     prev = ""
     for c in sorted(cands, reverse=True):
         try:
             m = json.loads(out(f"cat {c}/manifest.json"))
         except Exception:
             continue
-        if (m.get("old_collect_sha") == sha0_map.get("matrix-collect")
-                and m.get("old_app_sha") == sha0_map.get("matrix-app")):
+        if (m.get("old_collect_sha") == sha_before_map.get("matrix-collect")
+                and m.get("old_app_sha") == sha_before_map.get("matrix-app")):
             prev = c
             break
-    t["prev_candidates"] = cands
     t["prev_chosen"] = prev
     t["prev_units_saved"] = (json.loads(out(f"cat {prev}/manifest.json")).get("units_saved")
                              if prev else [])
 
-    # --- 2. rollback to the pair that was just replaced (binaries + its units)
+    # --- 3. rollback to the pair that was just replaced (binaries + its units)
     r = ssh(f"{BUILD}/deploy/rollback.sh --prefix {PREFIX} --unit-prefix matrix --to {prev} 2>&1", timeout=300)
     t["rollback"] = {"rc": r["rc"], "out": r["out"][-600:], "prev": prev,
                      "sha": out(f"sha256sum {PREFIX}/bin/matrix-*")}
@@ -634,7 +664,11 @@ def test_a4():
     r = ssh(f"{BUILD}/deploy/install.sh --bin-src {BUILD}/target/release --prefix {PREFIX} "
             f"--unit-prefix matrix 2>&1 | tail -1", timeout=300)
     t["normalized"] = {"rc": r["rc"], "sha": out(f"sha256sum {PREFIX}/bin/matrix-*")}
-    t["normalized_matches_reference"] = t["normalized"]["sha"] == sha0
+    ref_sha = out(f"sha256sum {BUILD}/target/release/matrix-collect {BUILD}/target/release/matrix-app")
+    t["reference_build_sha"] = ref_sha
+    t["normalized_matches_reference"] = (
+        sorted(l.split()[0] for l in t["normalized"]["sha"].splitlines() if l.strip())
+        == sorted(l.split()[0] for l in ref_sha.splitlines() if l.strip()))
     h = health(40)
     t["normalized_health"] = h.get("ok")
     t["deploy_log_tail"] = out(f"tail -3 {PREFIX}/etc/deploy-log.jsonl")
@@ -644,8 +678,9 @@ def test_a4():
     # Stage-5 snapshot: a pre-Stage-8 collector cannot parse the Stage-8 unit's
     # --max-db-mb, which is the real incompatibility documented in HARNESS-NOTES.)
     TGT = "/home/main/matrix-tgt"
+    tgt_from = prev_pair or f"{BUILD}/target/release"
     r = ssh(f"{BUILD}/deploy/install.sh --prefix {TGT} --unit-prefix matrixtgt "
-            f"--bin-src {BUILD}/target/release --no-app --no-start 2>&1", timeout=180)
+            f"--bin-src {tgt_from} --no-app --no-start 2>&1", timeout=180)
     t["tgt_install"] = {"rc": r["rc"], "out": r["out"][-500:],
                         "enabled": out("systemctl --user is-enabled matrixtgt-collect.service"),
                         "active": out("systemctl --user is-active matrixtgt-collect.service")}
@@ -708,7 +743,8 @@ def test_a4():
     t["live_untouched"] = t["live_db_same_inode"] and t["live_db_same_dir_listing"]
     t["live_health_close_a4"] = health(40).get("ok")
 
-    ok = (t["rollback"]["rc"] == 0 and t["rollback_health"] and t["rollback_sha_match_manifest"]
+    ok = (t.get("prev_install_health") is True
+          and t["rollback"]["rc"] == 0 and t["rollback_health"] and t["rollback_sha_match_manifest"]
           and t["rollback_units_restored"] and bool(t["prev_units_saved"])
           and t["deploy"]["rc"] == 0 and t["deploy_health"] and t["deploy_sha_changed"]
           and t["normalized_matches_reference"] and t["normalized_health"]
@@ -826,6 +862,9 @@ con.execute("VACUUM INTO " + json.dumps(dst)); con.close()
 tables = ("events", "sessions", "passes", "routing", "perf")
 c0 = sqlite3.connect(dst)
 before = {t: c0.execute("select count(*) from " + t).fetchone()[0] for t in tables}
+# the store's own rule: an unfinished session is never expired, so the copy's
+# open-session count is what must survive (measured, not assumed to be 0)
+open_before = c0.execute("select count(*) from sessions where finished=0").fetchone()[0]
 c0.close()
 con = sqlite3.connect(dst); con.isolation_level = None
 con.execute("update events set ts = ts - 3*86400")
@@ -847,8 +886,10 @@ c1 = sqlite3.connect(dst)
 after = {t: c1.execute("select count(*) from " + t).fetchone()[0] for t in tables}
 integ = c1.execute("pragma integrity_check").fetchone()[0]
 floor = c1.execute("select min(seq) from events").fetchone()[0]
+open_after = c1.execute("select count(*) from sessions where finished=0").fetchone()[0]
 c1.close()
 print(json.dumps({"prune": pr, "before": before, "after": after,
+                  "open_sessions_before": open_before, "open_sessions_after": open_after,
                   "size_before": size_before, "size_after": os.path.getsize(dst),
                   "integrity": integ, "floor_seq": floor, "rc": r.returncode}))
 """
@@ -865,7 +906,9 @@ print(json.dumps({"prune": pr, "before": before, "after": after,
     ex = t["expiry"]
     t["expiry_ok"] = bool(
         ex.get("rc") == 0 and ex.get("integrity") == "ok"
-        and (ex.get("after") or {}).get("sessions") == 0
+        # only *finished* sessions expire; the active window is kept by design,
+        # so the expected survivor count is the copy's own open-session count
+        and (ex.get("after") or {}).get("sessions") == ex.get("open_sessions_before")
         and (ex.get("after") or {}).get("routing") == 0
         and (ex.get("after") or {}).get("passes") == 0
         and (ex.get("after") or {}).get("events", 1) < (ex.get("before") or {}).get("events", 0)
@@ -962,14 +1005,29 @@ print(json.dumps({"size_cap": cap, "integrity": integ, "rc": r.returncode,
 
     # state: run/ still carries pid/stats files left by the Stage-3..7 harnesses
     # (which own these paths). Keep only what the live units use, and measure.
+    # A directly-started app from an earlier suite keeps writing its own stats
+    # dump here, so stop those first (recorded, and only non-unit pids), then
+    # let the directory settle instead of racing the writer.
+    unit_pids = {out(f"systemctl --user show {u} -p MainPID --value") for u in (UNIT_A, UNIT_C)}
+    strays = []
+    for line in out(f"pgrep -fa {PREFIX}/bin/matrix-").splitlines():
+        pid, _, cmd = line.partition(" ")
+        if pid.isdigit() and pid not in unit_pids:
+            strays.append({"pid": pid, "cmd": cmd[:160]})
+            ssh(f"kill -TERM {pid} 2>/dev/null; true", timeout=30)
+    if strays:
+        time.sleep(1)
+    t["leftovers_stopped"] = strays
     run_before = out(f"ls -1 {PREFIX}/run | sort | tr '\n' ' '")
     run_bytes_before = int(out(f"du -sb {PREFIX}/run | cut -f1") or 0)
     ssh(f"cd {PREFIX}/run && for f in *; do case \"$f\" in collector.sock|live-stats.json) ;; *) rm -f -- \"$f\";; esac; done", timeout=120)
+    _, settled = wait_for(lambda: set(out(f"ls -1 {PREFIX}/run").split()) <= {"collector.sock", "live-stats.json"}, 10)
     t["run_cleanup"] = {
         "before_files": len(run_before.split()),
         "kept": out(f"ls -1 {PREFIX}/run | tr '\n' ' '"),
         "before_bytes": run_bytes_before,
         "after_bytes": int(out(f"du -sb {PREFIX}/run | cut -f1") or 0),
+        "settled": bool(settled),
     }
 
     # state bounds: DB, WAL, run dir, log dir
@@ -987,6 +1045,7 @@ print(json.dumps({"size_cap": cap, "integrity": integ, "rc": r.returncode,
           and t["journal_files"]["after"] > t["journal_files"]["before"] and t["under_cap"]
           and t["collector"]["lines"] > 0 and t["app"]["lines"] > 0
           and t["run_cleanup"]["before_files"] >= 2
+          and t["run_cleanup"]["settled"]
           and set(t["state"]["run_files"].split()) <= {"collector.sock", "live-stats.json"}
           and (t["rate_limit_supported_for_user_units"] or t["rate_limit_documented"])
           and t["expiry_ok"] and t["export_ok"] and t["live_retention_ok"]
@@ -1086,22 +1145,52 @@ print(json.dumps({"seconds": round(dur, 2), "watermark": w,
                        and rr[0].split("=", 1)[1] == ll[0].split("=", 1)[1])
     t["collector_stayed_up"] = out(f"systemctl --user is-active {UNIT_C}") == "active"
 
-    # --- arithmetic in the runbook vs live numbers
+    # --- arithmetic in the runbook vs live numbers. The old check ended at
+    # `per_event > 0`, which any non-empty store satisfies: it could not tell a
+    # measured figure from a made-up one. The runbook now quotes two measured
+    # ratios and this compares the live measurement against them:
+    #   on disk  copy_bytes / events              ("~630 B/event")
+    #   NDJSON   events.ndjson bytes / lines      ("~290 B per NDJSON event line")
+    # ±50 % covers a store that is mostly pages vs one that is mostly payload;
+    # a number invented in the doc (or a store that drifts 2x from the claim)
+    # fails.
+    r = ssh(f"rm -rf /tmp/s8-a6-exp && {PREFIX}/bin/matrix-collect --db {PREFIX}/data/telemetry.sqlite "
+            f"--export /tmp/s8-a6-exp >/dev/null 2>&1; wc -lc < /tmp/s8-a6-exp/events.ndjson; "
+            f"rm -rf /tmp/s8-a6-exp", timeout=600)
+    try:
+        exp_lines, exp_bytes = [int(x) for x in r["out"].split()[-2:]]
+    except Exception:
+        exp_lines, exp_bytes = 0, 0
     live = sql("select count(*) as n from events")[0]["n"]
     db_bytes = int(out(f"stat -c %s {PREFIX}/data/telemetry.sqlite") or 0)
     per_event = round((meas.get("copy_bytes") or db_bytes) / live) if live else 0
+    per_line = round(exp_bytes / exp_lines) if exp_lines else 0
     rng = re.search(r"(\d+)\s*[\u2013-]\s*(\d+)\s*GB", text)
     doc_range = (int(rng.group(1)), int(rng.group(2))) if rng else None
+    mb = re.search(r"~(\d+)\s*B/event", text)
+    ml = re.search(r"~(\d+)\s*B per NDJSON event line", text)
+    doc_per_event = int(mb.group(1)) if mb else None
+    doc_per_line = int(ml.group(1)) if ml else None
     t["arithmetic"] = {"db_bytes": db_bytes, "events": live, "bytes_per_event": per_event,
+                       "export_lines": exp_lines, "export_bytes": exp_bytes,
+                       "bytes_per_event_line": per_line,
+                       "doc_bytes_per_event": doc_per_event, "doc_bytes_per_event_line": doc_per_line,
                        "retention_days": 1, "stage7_gb_per_day": 20.2,
                        "one_day_ceiling_gb": round(1 * 20.2, 1), "doc_range_gb": doc_range,
                        "doc_has": {k: (k in text) for k in
                                    ("20.2 GB/day", "B/event", "--retention-days 1", "--max-db-mb 25000",
                                     "replay_bounded_by_retention", "retention_expiry")}}
+
+    def within(measured, documented):
+        return bool(measured) and bool(documented) and abs(measured - documented) <= 0.5 * documented
+
+    t["arithmetic"]["per_event_matches_doc"] = within(per_event, doc_per_event)
+    t["arithmetic"]["per_line_matches_doc"] = within(per_line, doc_per_line)
     t["arithmetic_ok"] = (all(t["arithmetic"]["doc_has"].values())
                           and doc_range is not None
                           and doc_range[0] <= 20.2 <= doc_range[1]
-                          and per_event > 0)
+                          and t["arithmetic"]["per_event_matches_doc"]
+                          and t["arithmetic"]["per_line_matches_doc"])
 
     # --- every command the runbook marks verifiable is executed
     blocks = re.findall(r"```bash\n(.*?)```", text, re.S)
