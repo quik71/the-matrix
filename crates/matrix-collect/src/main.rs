@@ -1483,8 +1483,10 @@ fn main() {
                         vac = (before, s.db_bytes());
                     }
                 }
-                if pr.events + pr.sessions + pr.routing + pr.passes + pr.hw + pr.status + pr.perf > 0
-                    || comp.lines_removed > 0
+                // Always report the retention pass, even when it removed nothing:
+                // the line states the policy that is in force (days=0 means the
+                // window is disabled), which is the same honesty as the
+                // telemetry_status block. It is one line per collector start.
                 {
                     println!(
                         "{{\"log\":\"retention\",\"days\":{},\"cutoff_ts\":{:.3},\"hw_pruned\":{},\"status_pruned\":{},\"perf_pruned\":{},\"routing_pruned\":{},\"passes_pruned\":{},\"sessions_pruned\":{},\"events_pruned\":{},\"floor_seq\":{},\"oldest_ts\":{},\"freelist_bytes\":{},\"vacuumed\":{},\"db_bytes_before\":{},\"db_bytes_after\":{},\"event_line_hours\":{},\"event_lines_compacted\":{},\"sessions_compacted\":{},\"sessions_skipped\":{}}}",
