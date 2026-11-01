@@ -576,10 +576,28 @@ impl Store {
     /// `meta`, `gap` and `residency_estimate` lines are kept (they are the
     /// audit trail of collector runs and cost a few hundred bytes each).
     ///
+    /// `days <= 0` disables the time window entirely (nothing expires; the size
+    /// cap is then the only bound). 0 used to mean "cutoff = now", which with a
+    /// real ceiling would wipe the store on every restart — measured by S3-A7,
+    /// which restarts with `--retention-days 0` and expects its rows to survive.
+    ///
     /// Returns the counts plus the new replay floor, so the caller can be
     /// honest about it (`telemetry_status.retention`).
     pub fn prune(&mut self, days: i64, vacuum: bool) -> Result<Pruned, String> {
-        let cutoff = crate::now_unix() - (days.max(0) as f64) * 86400.0;
+        if days <= 0 {
+            let (floor, oldest) = self.retention_floor();
+            let bytes = self.db_bytes();
+            return Ok(Pruned {
+                cutoff_ts: 0.0,
+                floor_seq: floor,
+                oldest_ts: oldest,
+                bytes_before: bytes,
+                bytes_after: bytes,
+                freelist_bytes: self.freelist_bytes(),
+                ..Default::default()
+            });
+        }
+        let cutoff = crate::now_unix() - (days as f64) * 86400.0;
         let mut pr = Pruned {
             cutoff_ts: cutoff,
             bytes_before: self.db_bytes(),

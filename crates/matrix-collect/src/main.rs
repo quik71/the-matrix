@@ -220,7 +220,10 @@ fn parse_args() -> Result<Cfg, String> {
                      --queue-cap N           per-subscriber queue bound (4096)\n\
                      --replay-max N          reconnect replay bound in events (5000)\n\
                      --retention-days N      real ceiling: passes/sessions/routing/expert lines/perf/
-                     events older than N days are deleted (1); meta/gap/residency kept\n\
+                     events older than N days are deleted (1); meta/gap/residency kept;
+                     0 disables the time window (the size cap still bounds the store)
+                     --max-db-mb N           hard size cap in MB (25000), applied after expiry:
+                     oldest sessions, then routing/events, are evicted until it fits
                      --no-persist            run without SQLite\n\
                      --replay <session>      re-emit a stored session as NDJSON and exit\n\
                      --offset N              explicit start offset (default: persisted cursor, else EOF)"
@@ -1192,7 +1195,9 @@ fn retention_json_of(pr: &db::Pruned, cfg: &Cfg, cap: &db::SizeEvict) -> String 
     kv(&mut o, "size_evicted_oldest_ts",
        &cap.oldest_ts.map(|v| format!("{v:.3}")).unwrap_or_else(|| "null".into()), false);
     kv(&mut o, "db_bytes", &cap.bytes_after.max(pr.bytes_after).to_string(), false);
-    kv(&mut o, "replay_bounded_by_retention", "true", false);
+    // `--retention-days 0` disables the window (see Store::prune): replay is
+    // then bounded only by the size cap, and saying so is the honest report.
+    kv(&mut o, "replay_bounded_by_retention", if cfg.retention_days > 0 { "true" } else { "false" }, false);
     // strings must be quoted, unlike the numeric kv() values above
     o.push(',');
     o.push('"');
@@ -1201,8 +1206,12 @@ fn retention_json_of(pr: &db::Pruned, cfg: &Cfg, cap: &db::SizeEvict) -> String 
     o.push(':');
     o.push('"');
     o.push_str(&format!(
-        "replay and export only see rows inside {} day(s) and budgeted to {} MB; history shortened by time expiry{}; run --export before it expires to keep longer",
-        cfg.retention_days,
+        "{} budgeted to {} MB; history shortened by time expiry{}; run --export to keep longer",
+        if cfg.retention_days > 0 {
+            format!("replay and export only see rows inside {} day(s) and", cfg.retention_days)
+        } else {
+            "time expiry disabled (--retention-days 0): replay sees all stored rows,".to_string()
+        },
         cfg.max_db_mb,
         if cap.evicted > 0 { " and by the size cap" } else { "" }
     ));
