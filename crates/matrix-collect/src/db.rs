@@ -42,6 +42,45 @@ pub struct Store {
     pub has_ts: bool,
 }
 
+/// Result of a retention cut (see `Store::prune`).
+#[derive(Default, Clone, Debug)]
+pub struct Pruned {
+    pub hw: usize,
+    pub status: usize,
+    pub perf: usize,
+    pub routing: usize,
+    pub passes: usize,
+    pub sessions: usize,
+    pub events: usize,
+    pub cutoff_ts: f64,
+    pub floor_seq: Option<i64>,
+    pub oldest_ts: Option<f64>,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    pub freelist_bytes: u64,
+    pub vacuumed: bool,
+}
+
+/// Result of the hard size cap (`Store::enforce_size_cap`).
+#[derive(Default, Clone, Debug)]
+pub struct SizeEvict {
+    pub cap_bytes: u64,
+    pub evicted: usize,
+    pub sessions: usize,
+    pub passes: usize,
+    pub routing: usize,
+    pub events: usize,
+    pub freelist_bytes: u64,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    pub vacuumed: bool,
+    pub floor_seq: Option<i64>,
+    pub oldest_ts: Option<f64>,
+}
+
+/// Below this freelist size a VACUUM costs more than it returns.
+pub const VACUUM_THRESHOLD: u64 = 32 * 1024 * 1024;
+
 impl Store {
     pub fn open(path: &str) -> Result<Store, String> {
         if let Some(dir) = Path::new(path).parent() {
@@ -531,17 +570,218 @@ impl Store {
         Ok(())
     }
 
-    pub fn prune(&mut self, days: i64) -> Result<(usize, usize), String> {
-        let cutoff = crate::now_unix() - (days as f64) * 86400.0;
-        let hw = self
+    /// Retention cut. `days` is a REAL ceiling for routing too: passes,
+    /// sessions, expert/routing lines, perf samples and the emitted event lines
+    /// older than the cutoff are deleted. Only the tiny, restart-bounded
+    /// `meta`, `gap` and `residency_estimate` lines are kept (they are the
+    /// audit trail of collector runs and cost a few hundred bytes each).
+    ///
+    /// Returns the counts plus the new replay floor, so the caller can be
+    /// honest about it (`telemetry_status.retention`).
+    pub fn prune(&mut self, days: i64, vacuum: bool) -> Result<Pruned, String> {
+        let cutoff = crate::now_unix() - (days.max(0) as f64) * 86400.0;
+        let mut pr = Pruned {
+            cutoff_ts: cutoff,
+            bytes_before: self.db_bytes(),
+            ..Default::default()
+        };
+        pr.hw = self
             .conn
             .execute("DELETE FROM hw WHERE ts < ?1", params![cutoff])
             .map_err(|e| e.to_string())?;
-        let st = self
+        pr.status = self
             .conn
             .execute("DELETE FROM status WHERE ts < ?1", params![cutoff])
             .map_err(|e| e.to_string())?;
-        Ok((hw, st))
+        pr.perf = self
+            .conn
+            .execute("DELETE FROM perf WHERE ts < ?1", params![cutoff])
+            .map_err(|e| e.to_string())?;
+        // routing/passes go first, while the sessions that own them still exist
+        pr.routing = self
+            .conn
+            .execute(
+                "DELETE FROM routing WHERE session IN
+                   (SELECT id FROM sessions WHERE started_ts < ?1)",
+                params![cutoff],
+            )
+            .map_err(|e| e.to_string())?;
+        pr.passes = self
+            .conn
+            .execute(
+                "DELETE FROM passes WHERE session IN
+                   (SELECT id FROM sessions WHERE started_ts < ?1)",
+                params![cutoff],
+            )
+            .map_err(|e| e.to_string())?;
+        pr.events = self
+            .conn
+            .execute(
+                "DELETE FROM events WHERE ts < ?1
+                   AND kind NOT IN ('meta','gap','residency_estimate')",
+                params![cutoff],
+            )
+            .map_err(|e| e.to_string())?;
+        // only finished sessions are removed: an active window is never expired
+        pr.sessions = self
+            .conn
+            .execute(
+                "DELETE FROM sessions WHERE started_ts < ?1 AND finished = 1",
+                params![cutoff],
+            )
+            .map_err(|e| e.to_string())?;
+        let (floor, oldest) = self.retention_floor();
+        pr.floor_seq = floor;
+        pr.oldest_ts = oldest;
+        pr.freelist_bytes = self.freelist_bytes();
+        if vacuum && pr.freelist_bytes >= VACUUM_THRESHOLD {
+            self.vacuum()?;
+            pr.vacuumed = true;
+        }
+        pr.bytes_after = self.db_bytes();
+        Ok(pr)
+    }
+
+    /// Hard size cap: a real floor under the disk, applied AFTER time expiry.
+    /// Evicts the oldest routing data first (sessions by `started_ts`, then the
+    /// orphan event/perf/hw/status rows by `ts`) until the live page count fits
+    /// `max_bytes`, then VACUUMs. Time expiry is always tried first; this is the
+    /// overflow hammer, never the primary policy.
+    pub fn enforce_size_cap(&mut self, max_bytes: u64) -> Result<SizeEvict, String> {
+        let mut ev = SizeEvict { cap_bytes: max_bytes, bytes_before: self.db_bytes(), ..Default::default() };
+        if max_bytes == 0 || self.live_bytes() <= max_bytes {
+            ev.bytes_after = ev.bytes_before;
+            return Ok(ev);
+        }
+        // Evict in slices of ~1/16 of the sessions so a few very large sessions
+        // cannot make the hammer overshoot the cap by gigabytes.
+        let total_sessions: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap_or(0);
+        let batch = (total_sessions / 16).max(1);
+        for _ in 0..200 {
+            if self.live_bytes() <= max_bytes {
+                break;
+            }
+            let mut n_ev = 0usize;
+            {
+                let ids: Vec<String> = {
+                    let mut st = self
+                        .conn
+                        .prepare("SELECT id FROM sessions ORDER BY started_ts ASC LIMIT ?1")
+                        .map_err(|e| format!("cap prepare: {e}"))?;
+                    let it = st
+                        .query_map(params![batch], |r| r.get::<_, String>(0))
+                        .map_err(|e| format!("cap query: {e}"))?;
+                    it.flatten().collect()
+                };
+                if ids.is_empty() {
+                    // no sessions left: drop the oldest orphan rows by ts
+                    let n = self
+                        .conn
+                        .execute(
+                            "DELETE FROM events WHERE seq IN
+                               (SELECT seq FROM events ORDER BY seq ASC LIMIT 50000)",
+                            [],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    n_ev += n;
+                    if n == 0 {
+                        let p = self
+                            .conn
+                            .execute("DELETE FROM perf WHERE row_id IN (SELECT row_id FROM perf ORDER BY ts ASC LIMIT 50000)", [])
+                            .map_err(|e| e.to_string())?;
+                        let h = self
+                            .conn
+                            .execute("DELETE FROM hw WHERE row_id IN (SELECT row_id FROM hw ORDER BY ts ASC LIMIT 50000)", [])
+                            .map_err(|e| e.to_string())?;
+                        let st = self
+                            .conn
+                            .execute("DELETE FROM status WHERE row_id IN (SELECT row_id FROM status ORDER BY ts ASC LIMIT 50000)", [])
+                            .map_err(|e| e.to_string())?;
+                        n_ev += p + h + st;
+                        if n_ev == 0 {
+                            break; // nothing left to evict
+                        }
+                    }
+                    ev.events += n_ev;
+                    continue;
+                }
+                for id in &ids {
+                    ev.routing += self.conn.execute("DELETE FROM routing WHERE session=?1", params![id]).map_err(|e| e.to_string())?;
+                    ev.passes += self.conn.execute("DELETE FROM passes WHERE session=?1", params![id]).map_err(|e| e.to_string())?;
+                    ev.events += self.conn.execute("DELETE FROM events WHERE session=?1", params![id]).map_err(|e| e.to_string())?;
+                    ev.sessions += self.conn.execute("DELETE FROM sessions WHERE id=?1", params![id]).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        ev.freelist_bytes = self.freelist_bytes();
+        self.vacuum()?;
+        ev.vacuumed = true;
+        ev.bytes_after = self.db_bytes();
+        ev.evicted = ev.sessions + ev.events + ev.routing + ev.passes;
+        let (floor, oldest) = self.retention_floor();
+        ev.floor_seq = floor;
+        ev.oldest_ts = oldest;
+        Ok(ev)
+    }
+
+    /// Bytes that are actually in use (total minus the freelist): what a VACUUM
+    /// would leave behind. Used to decide eviction without paying for a VACUUM.
+    pub fn live_bytes(&self) -> u64 {
+        let pc: i64 = self.conn.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap_or(0);
+        let fc: i64 = self.conn.query_row("PRAGMA freelist_count", [], |r| r.get(0)).unwrap_or(0);
+        let ps: i64 = self.conn.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap_or(0);
+        ((pc - fc).max(0) * ps).max(0) as u64
+    }
+
+    /// Most recent stored line of a kind (used to hand `meta`/`residency` to a
+    /// subscriber that attaches before the in-memory copy exists: without it a
+    /// reconnect right after a restart can get an empty replay preload).
+    pub fn last_event_of_kind(&self, kind: &str) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT line FROM events WHERE kind=?1 ORDER BY seq DESC LIMIT 1",
+                params![kind],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+    }
+
+    /// Smallest seq and oldest timestamp still present in `events` (the replay
+    /// floor). `None` when the store is empty.
+    pub fn retention_floor(&self) -> (Option<i64>, Option<f64>) {
+        let floor: Option<i64> = self
+            .conn
+            .query_row("SELECT MIN(seq) FROM events", [], |r| r.get(0))
+            .unwrap_or(None);
+        let oldest: Option<f64> = self
+            .conn
+            .query_row("SELECT MIN(ts) FROM events", [], |r| r.get(0))
+            .unwrap_or(None);
+        (floor, oldest)
+    }
+
+    /// Bytes sitting in SQLite's freelist: what a VACUUM (incremental or full)
+    /// would give back. `auto_vacuum` is NONE for this schema, so a full VACUUM
+    /// is the only way to return pages to the filesystem.
+    pub fn freelist_bytes(&self) -> u64 {
+        let fc: i64 = self
+            .conn
+            .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+            .unwrap_or(0);
+        let ps: i64 = self
+            .conn
+            .query_row("PRAGMA page_size", [], |r| r.get(0))
+            .unwrap_or(0);
+        (fc * ps).max(0) as u64
+    }
+
+    pub fn vacuum(&mut self) -> Result<(), String> {
+        self.conn
+            .execute_batch("VACUUM")
+            .map_err(|e| format!("vacuum: {e}"))
     }
 
     // ------------------------------------------------------- Stage 7: lifecycle

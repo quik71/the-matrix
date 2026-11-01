@@ -1,19 +1,23 @@
 [Unit]
 Description=THE MATRIX telemetry collector (@UNIT_PREFIX@: routing trace -> NDJSON + SQLite)
 Documentation=file://@PREFIX@/OPS-RUNBOOK.md
+# Retention is a REAL ceiling: passes/sessions/routing/expert lines/perf and the
+# emitted event lines older than @RETENTION@ day are deleted at startup, and free
+# pages are VACUUM'd back, and --max-db-mb is a hard floor: if the store is still
+# over budget the OLDEST data is evicted (only meta/gap/residency lines are kept).
 # The engine is its own user unit and may be restarted independently; the
 # collector must never be ordered *before* it (it only reads /metrics and the
 # trace file, which it tolerates being absent), but it should come up with the
 # user session and it must survive its own crashes.
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=60
-StartLimitBurst=10
+StartLimitIntervalSec=300
+StartLimitBurst=30
 
 [Service]
 Type=simple
 WorkingDirectory=@PREFIX@
-ExecStart=@PREFIX@/bin/matrix-collect --path @TRACE@ --socket @SOCKET@ --db @DB@ --engine @ENGINE@ --engine-conf @ENGINE_CONF@
+ExecStart=@PREFIX@/bin/matrix-collect --path @TRACE@ --socket @SOCKET@ --db @DB@ --engine @ENGINE@ --engine-conf @ENGINE_CONF@ --retention-days @RETENTION@ --max-db-mb @MAXDB@
 # kill -9 and any non-zero exit are failures and must be repaired by the unit.
 Restart=on-failure
 RestartSec=2

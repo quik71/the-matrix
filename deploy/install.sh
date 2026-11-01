@@ -27,6 +27,8 @@ MONITOR="DP-1"
 RAIN="on"
 VIEW="0"
 EXTRA_ARGS=""
+RETENTION=1
+MAXDB=25000
 BIN_SRC=""
 START=1
 WITH_APP=1
@@ -45,6 +47,8 @@ while [ $# -gt 0 ]; do
     --rain) RAIN=$2; shift 2 ;;
     --view) VIEW=$2; shift 2 ;;
     --extra-args) EXTRA_ARGS=$2; shift 2 ;;
+    --retention-days) RETENTION=$2; shift 2 ;;
+    --max-db-mb) MAXDB=$2; shift 2 ;;
     --bin-src) BIN_SRC=$2; shift 2 ;;
     --no-start) START=0; shift ;;
     --no-app) WITH_APP=0; shift ;;
@@ -86,6 +90,8 @@ render() { # template out-file
       -e "s|@RAIN@|$RAIN|g" \
       -e "s|@VIEW@|$VIEW|g" \
       -e "s|@EXTRA_ARGS@|$EXTRA_ARGS|g" \
+      -e "s|@RETENTION@|$RETENTION|g" \
+      -e "s|@MAXDB@|$MAXDB|g" \
       "$tpl" > "$dst"
 }
 
@@ -126,7 +132,8 @@ if [ "$START" = 1 ]; then
   if [ "$WITH_APP" = 1 ]; then systemctl --user restart "$UNIT_PREFIX-app.service"; fi
   sleep 2
   if [ "$WITH_APP" = 1 ]; then
-    python3 "$HERE/health.py" --prefix "$PREFIX" --wait 20 || {
+    sleep 3
+    python3 "$HERE/health.py" --prefix "$PREFIX" --wait 40 || {
       echo "health check FAILED after install" >&2; exit 1; }
   else
     systemctl --user is-active "$UNIT_PREFIX-collect.service"

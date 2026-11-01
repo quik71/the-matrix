@@ -57,6 +57,7 @@ struct Cfg {
     interval_ms: u64,
     no_persist: bool,
     retention_days: i64,
+    max_db_mb: i64,
     replay: Option<String>,
     queue_cap: usize,
     replay_max: usize,
@@ -83,7 +84,8 @@ impl Default for Cfg {
             engine_conf: "/home/main/strata-0.2.4.2/strata-iq3_s.json".into(),
             interval_ms: 150,
             no_persist: false,
-            retention_days: 30,
+            retention_days: 1,
+            max_db_mb: 25000,
             replay: None,
             queue_cap: 4096,
             replay_max: 5000,
@@ -163,6 +165,10 @@ fn parse_args() -> Result<Cfg, String> {
                 c.quiet_ms = need(i)?.parse().map_err(|_| "--quiet-ms")?;
                 i += 2;
             }
+            "--max-db-mb" => {
+                c.max_db_mb = need(i)?.parse().map_err(|_| "--max-db-mb")?;
+                i += 2;
+            }
             "--retention-days" => {
                 c.retention_days = need(i)?.parse().map_err(|_| "--retention-days")?;
                 i += 2;
@@ -213,7 +219,8 @@ fn parse_args() -> Result<Cfg, String> {
                      --hw-ms N               hw_sample interval (5000)\n\
                      --queue-cap N           per-subscriber queue bound (4096)\n\
                      --replay-max N          reconnect replay bound in events (5000)\n\
-                     --retention-days N      prune hw/status older than N days (30), routing never pruned\n\
+                     --retention-days N      real ceiling: passes/sessions/routing/expert lines/perf/
+                     events older than N days are deleted (1); meta/gap/residency kept\n\
                      --no-persist            run without SQLite\n\
                      --replay <session>      re-emit a stored session as NDJSON and exit\n\
                      --offset N              explicit start offset (default: persisted cursor, else EOF)"
@@ -386,6 +393,10 @@ struct Core {
     /// once and handed to every later subscriber, labelled estimate, so a late
     /// client can paint the structural tint without reading the DB.
     res_line: Option<String>,
+    /// JSON fragment describing the retention cut applied at startup (days,
+    /// cutoff, replay floor, expired counts). Emitted in every
+    /// `telemetry_status` so a client can say *why* its replay got shorter.
+    retention_json: String,
 }
 
 impl Core {
@@ -825,7 +836,7 @@ impl Core {
             None => "{\"ok\":false,\"enabled\":false,\"error\":\"--no-persist\"}".to_string(),
         };
         let body = format!(
-            ",\"run_id\":\"{}\",\"pid\":{},\"uptime_s\":{:.1},\"events_total\":{},\"sessions_total\":{},\"rates\":{{\"events_per_s\":{:.1},\"records_per_s\":{:.1},\"bytes_per_s\":{:.0}}},\"subscribers\":{},\"per_subscriber\":{},\"queue_cap\":{},\"drops_total\":{},\"skipped_bytes_total\":{},\"skipped_bytes_since_last_event\":{},\"resyncs_total\":{},\"discarded_passes\":{},\"trace\":{{\"offset\":{},\"anchor\":{},\"held_records\":{},\"file_size\":{},\"path\":\"{}\"}},\"gap_bytes_total\":{},\"db\":{},\"engine\":{{\"ok\":{},\"requests_total\":{},\"state\":\"{}\",\"errors\":{}}},\"session_active\":{},\"unattributed_requests\":{},\"replay_max\":{}",
+            ",\"run_id\":\"{}\",\"pid\":{},\"uptime_s\":{:.1},\"events_total\":{},\"sessions_total\":{},\"rates\":{{\"events_per_s\":{:.1},\"records_per_s\":{:.1},\"bytes_per_s\":{:.0}}},\"subscribers\":{},\"per_subscriber\":{},\"queue_cap\":{},\"drops_total\":{},\"skipped_bytes_total\":{},\"skipped_bytes_since_last_event\":{},\"resyncs_total\":{},\"discarded_passes\":{},\"trace\":{{\"offset\":{},\"anchor\":{},\"held_records\":{},\"file_size\":{},\"path\":\"{}\"}},\"gap_bytes_total\":{},\"db\":{},\"engine\":{{\"ok\":{},\"requests_total\":{},\"state\":\"{}\",\"errors\":{}}},\"session_active\":{},\"unattributed_requests\":{},\"replay_max\":{},\"retention\":{}",
             json::esc(&self.run_id),
             process::id(),
             self.t0.elapsed().as_secs_f64(),
@@ -858,7 +869,8 @@ impl Core {
                 None => "null".into(),
             },
             self.unattributed_requests,
-            self.cfg.replay_max
+            self.cfg.replay_max,
+            self.retention_json
         );
         let sessid = self.win.as_ref().map(|w| w.id.clone());
         self.emit("telemetry_status", sessid.as_deref(), false, &body);
@@ -1034,6 +1046,21 @@ impl Core {
             // collector started never saw the startup `meta` event. Hand it the
             // stored line first — exactly the bytes that were recorded, counted
             // in this subscriber's replayed total.
+            // A subscriber can attach in the window between socket accept and
+            // the startup `meta`/`residency` emits. Fall back to the stored line
+            // so the preload is never empty just because we were early.
+            if self.meta_line.is_none() {
+                let m = self.store.as_ref().and_then(|st| st.last_event_of_kind("meta"));
+                if let Some(m) = m {
+                    self.meta_line = Some(m);
+                }
+            }
+            if self.res_line.is_none() {
+                let r = self.store.as_ref().and_then(|st| st.last_event_of_kind("residency_estimate"));
+                if let Some(r) = r {
+                    self.res_line = Some(r);
+                }
+            }
             if let Some(ml) = self.meta_line.clone() {
                 let already = lines.iter().any(|l| l.contains("\"type\":\"meta\""));
                 if !already {
@@ -1100,6 +1127,90 @@ impl Core {
     }
 }
 
+
+/// `size_cap` fragment for the maintenance output (escape-free by construction).
+fn size_cap_json(cap: &db::SizeEvict) -> String {
+    let mut o = String::with_capacity(256);
+    let kv = |o: &mut String, k: &str, v: &str, first: bool| {
+        if !first {
+            o.push(',');
+        }
+        o.push('"');
+        o.push_str(k);
+        o.push('"');
+        o.push(':');
+        o.push_str(v);
+    };
+    o.push('{');
+    kv(&mut o, "cap_bytes", &cap.cap_bytes.to_string(), true);
+    kv(&mut o, "evicted", &cap.evicted.to_string(), false);
+    kv(&mut o, "sessions_evicted", &cap.sessions.to_string(), false);
+    kv(&mut o, "routing_evicted", &cap.routing.to_string(), false);
+    kv(&mut o, "passes_evicted", &cap.passes.to_string(), false);
+    kv(&mut o, "events_evicted", &cap.events.to_string(), false);
+    kv(&mut o, "bytes_before", &cap.bytes_before.to_string(), false);
+    kv(&mut o, "bytes_after", &cap.bytes_after.to_string(), false);
+    kv(&mut o, "vacuumed", if cap.vacuumed { "true" } else { "false" }, false);
+    kv(&mut o, "oldest_ts_after",
+       &cap.oldest_ts.map(|v| format!("{v:.3}")).unwrap_or_else(|| "null".into()), false);
+    kv(&mut o, "floor_seq_after",
+       &cap.floor_seq.map(|v| v.to_string()).unwrap_or_else(|| "null".into()), false);
+    o.push('}');
+    o
+}
+
+/// Build the `retention` JSON fragment advertised in every telemetry_status.
+/// Written with push/push_str so the escapes stay readable: this block is the
+/// honesty machinery for both policies (time window and size cap).
+fn retention_json_of(pr: &db::Pruned, cfg: &Cfg, cap: &db::SizeEvict) -> String {
+    let mut o = String::with_capacity(512);
+    let kv = |o: &mut String, k: &str, v: &str, first: bool| {
+        if !first {
+            o.push(',');
+        }
+        o.push('"');
+        o.push_str(k);
+        o.push('"');
+        o.push(':');
+        o.push_str(v);
+    };
+    o.push('{');
+    kv(&mut o, "days", &cfg.retention_days.to_string(), true);
+    kv(&mut o, "cutoff_ts", &format!("{:.3}", pr.cutoff_ts), false);
+    kv(&mut o, "floor_seq",
+       &pr.floor_seq.map(|v| v.to_string()).unwrap_or_else(|| "null".into()), false);
+    kv(&mut o, "oldest_ts",
+       &pr.oldest_ts.map(|v| format!("{v:.3}")).unwrap_or_else(|| "null".into()), false);
+    kv(&mut o, "expired_events", &pr.events.to_string(), false);
+    kv(&mut o, "expired_sessions", &pr.sessions.to_string(), false);
+    kv(&mut o, "expired_routing", &pr.routing.to_string(), false);
+    kv(&mut o, "max_db_mb", &cfg.max_db_mb.to_string(), false);
+    kv(&mut o, "size_cap_bytes", &cap.cap_bytes.to_string(), false);
+    kv(&mut o, "size_evicted_sessions", &cap.sessions.to_string(), false);
+    kv(&mut o, "size_evicted_events", &cap.events.to_string(), false);
+    kv(&mut o, "size_evicted_routing", &cap.routing.to_string(), false);
+    kv(&mut o, "size_evicted_oldest_ts",
+       &cap.oldest_ts.map(|v| format!("{v:.3}")).unwrap_or_else(|| "null".into()), false);
+    kv(&mut o, "db_bytes", &cap.bytes_after.max(pr.bytes_after).to_string(), false);
+    kv(&mut o, "replay_bounded_by_retention", "true", false);
+    // strings must be quoted, unlike the numeric kv() values above
+    o.push(',');
+    o.push('"');
+    o.push_str("note");
+    o.push('"');
+    o.push(':');
+    o.push('"');
+    o.push_str(&format!(
+        "replay and export only see rows inside {} day(s) and budgeted to {} MB; history shortened by time expiry{}; run --export before it expires to keep longer",
+        cfg.retention_days,
+        cfg.max_db_mb,
+        if cap.evicted > 0 { " and by the size cap" } else { "" }
+    ));
+    o.push('"');
+    o.push('}');
+    o
+}
+
 // ------------------------------------------------- Stage 7: offline maintenance
 fn run_maintenance(cfg: &Cfg) -> ! {
     let mut parts: Vec<String> = Vec::new();
@@ -1137,7 +1248,7 @@ fn run_maintenance(cfg: &Cfg) -> ! {
         let before = st.counts();
         let before_b = st.db_bytes();
         let before_tables = st.table_bytes();
-        let (hw, stt) = match st.prune(cfg.retention_days) {
+        let pr = match st.prune(cfg.retention_days, cfg.vacuum) {
             Ok(v) => v,
             Err(e) => {
                 println!("{{\"ok\":false,\"mode\":\"prune\",\"error\":\"{}\"}}", json::esc(&e));
@@ -1146,6 +1257,13 @@ fn run_maintenance(cfg: &Cfg) -> ! {
         };
         let comp = match st.compact_event_lines(cfg.event_line_hours, cfg.vacuum) {
             Ok(c) => c,
+            Err(e) => {
+                println!("{{\"ok\":false,\"mode\":\"prune\",\"error\":\"{}\"}}", json::esc(&e));
+                process::exit(2);
+            }
+        };
+        let cap = match st.enforce_size_cap((cfg.max_db_mb.max(0) as u64) * 1024 * 1024) {
+            Ok(v) => v,
             Err(e) => {
                 println!("{{\"ok\":false,\"mode\":\"prune\",\"error\":\"{}\"}}", json::esc(&e));
                 process::exit(2);
@@ -1170,19 +1288,23 @@ fn run_maintenance(cfg: &Cfg) -> ! {
         };
         parts.push(format!(
             "\"prune\":{{\"ok\":true,\"db\":\"{}\",\"retention_days\":{},\"event_line_hours\":{},\"vacuum\":{},\
-\"hw_pruned\":{},\"status_pruned\":{},\"routing_pruned\":0,\"passes_pruned\":0,\"sessions_pruned\":0,\"events_pruned_other\":0,\
+\"hw_pruned\":{},\"status_pruned\":{},\"perf_pruned\":{},\"routing_pruned\":{},\"passes_pruned\":{},\"sessions_pruned\":{},\"events_pruned_other\":{},\"floor_seq\":{},\"freelist_bytes\":{},\"vacuumed\":{},\n
 \"event_lines_compacted\":{},\"sessions_compacted\":{},\"sessions_skipped\":{},\"cutoff_ts\":{:.3},\
 \"counts_before\":{{\"events\":{},\"expert_events\":{},\"sessions\":{},\"passes\":{},\"routing\":{},\"perf\":{},\"hw\":{},\"status\":{},\"gaps\":{}}},\
 \"counts_after\":{{\"events\":{},\"expert_events\":{},\"sessions\":{},\"passes\":{},\"routing\":{},\"perf\":{},\"hw\":{},\"status\":{},\"gaps\":{}}},\
 \"db_bytes_before\":{},\"db_bytes_after\":{},\"integrity\":\"{}\",\"table_bytes_before\":{},\"table_bytes_after\":{}}}",
             json::esc(&cfg.db), cfg.retention_days, cfg.event_line_hours, cfg.vacuum,
-            hw, stt, comp.lines_removed, comp.sessions, comp.sessions_skipped, comp.cutoff_ts,
+            pr.hw, pr.status, pr.perf, pr.routing, pr.passes, pr.sessions, pr.events,
+            pr.floor_seq.map(|v| v.to_string()).unwrap_or_else(|| "null".into()),
+            pr.freelist_bytes, pr.vacuumed,
+            comp.lines_removed, comp.sessions, comp.sessions_skipped, comp.cutoff_ts,
             before.events, before.expert_events, before.sessions, before.passes, before.routing,
             before.perf, before.hw, before.status, before.gaps,
             after.events, after.expert_events, after.sessions, after.passes, after.routing,
             after.perf, after.hw, after.status, after.gaps,
             before_b, after_b, json::esc(&integrity), tb(&before_tables), tb(&after_tables)
         ));
+        parts.push(format!("\"size_cap\":{}", size_cap_json(&cap)));
     }
     println!("{{\"tool\":\"matrix-collect maintenance\",\"version\":\"{}\",{}}}", VERSION, parts.join(","));
     let _ = std::io::stdout().flush();
@@ -1323,12 +1445,18 @@ fn main() {
     );
 
     // ---- store
+    let mut retention_json_out = String::from(
+        "{\"days\":0,\"floor_seq\":null,\"oldest_ts\":null,\"expired_events\":0,\"expired_sessions\":0,\"replay_bounded_by_retention\":false,\"note\":\"--no-persist: nothing is stored, so nothing expires\"}",
+    );
+    let mut expired_events = 0usize;
+    let mut expired_sessions = 0usize;
+    let mut cap_out = db::SizeEvict::default();
     let mut store = if cfg.no_persist {
         None
     } else {
         match Store::open(&cfg.db) {
             Ok(mut s) => {
-                let (hw, stt) = s.prune(cfg.retention_days).unwrap_or((0, 0));
+                let pr = s.prune(cfg.retention_days, false).unwrap_or_default();
                 let mut comp = db::Compact::default();
                 if cfg.event_line_hours > 0.0 {
                     match s.compact_event_lines(cfg.event_line_hours, false) {
@@ -1336,13 +1464,40 @@ fn main() {
                         Err(e) => eprintln!("warning: event-line compaction failed: {e}"),
                     }
                 }
-                if hw + stt + comp.lines_removed as usize > 0 {
+                // Pages freed by the cut are only returned to the filesystem by
+                // a VACUUM (this schema is auto_vacuum=NONE). Do it at startup,
+                // once, and only when there is real space to win back.
+                let mut vac = (0u64, 0u64);
+                if pr.freelist_bytes >= db::VACUUM_THRESHOLD {
+                    let before = s.db_bytes();
+                    if s.vacuum().is_ok() {
+                        vac = (before, s.db_bytes());
+                    }
+                }
+                if pr.events + pr.sessions + pr.routing + pr.passes + pr.hw + pr.status + pr.perf > 0
+                    || comp.lines_removed > 0
+                {
                     println!(
-                        "{{\"log\":\"retention\",\"days\":{},\"hw_pruned\":{},\"status_pruned\":{},\"routing_pruned\":0,\"event_line_hours\":{},\"event_lines_compacted\":{},\"sessions_compacted\":{},\"sessions_skipped\":{},\"db_bytes_before\":{},\"db_bytes_after\":{}}}",
-                        cfg.retention_days, hw, stt, cfg.event_line_hours, comp.lines_removed,
-                        comp.sessions, comp.sessions_skipped, comp.bytes_before, comp.bytes_after
+                        "{{\"log\":\"retention\",\"days\":{},\"cutoff_ts\":{:.3},\"hw_pruned\":{},\"status_pruned\":{},\"perf_pruned\":{},\"routing_pruned\":{},\"passes_pruned\":{},\"sessions_pruned\":{},\"events_pruned\":{},\"floor_seq\":{},\"oldest_ts\":{},\"freelist_bytes\":{},\"vacuumed\":{},\"db_bytes_before\":{},\"db_bytes_after\":{},\"event_line_hours\":{},\"event_lines_compacted\":{},\"sessions_compacted\":{},\"sessions_skipped\":{}}}",
+                        cfg.retention_days, pr.cutoff_ts, pr.hw, pr.status, pr.perf, pr.routing,
+                        pr.passes, pr.sessions, pr.events,
+                        pr.floor_seq.map(|v| v.to_string()).unwrap_or_else(|| "null".into()),
+                        pr.oldest_ts.map(|v| format!("{v:.3}")).unwrap_or_else(|| "null".into()),
+                        pr.freelist_bytes, vac.0 > 0, pr.bytes_before,
+                        if vac.0 > 0 { vac.1 } else { pr.bytes_after },
+                        cfg.event_line_hours, comp.lines_removed, comp.sessions, comp.sessions_skipped
                     );
                 }
+                // Order matters: time expiry first, then the size cap only if
+                // the store is still over budget.
+                let cap = s
+                    .enforce_size_cap((cfg.max_db_mb.max(0) as u64) * 1024 * 1024)
+                    .unwrap_or_default();
+                cap_out = cap.clone();
+                let retention_json = retention_json_of(&pr, &cfg, &cap);
+                retention_json_out = retention_json;
+                expired_events = pr.events + cap.events;
+                expired_sessions = pr.sessions + cap.sessions;
                 Some(s)
             }
             Err(e) => {
@@ -1503,7 +1658,33 @@ fn main() {
         last_finished: None,
         meta_line: None,
         res_line: None,
+        retention_json: retention_json_out.clone(),
     };
+
+    // If the retention cut removed rows, say so on the stream: subscribers that
+    // reconnect will start at a higher seq than they last saw, and that jump is
+    // a retention floor, not a collector bug. Emitted before the socket serves.
+    if cap_out.evicted > 0 {
+        let body = format!(
+            ",\"reason\":\"retention_size_evict\",\"bytes\":0,\"records_unattributed\":0,\"detail\":\"{} session(s), {} routing row(s) and {} event(s) evicted oldest-first to fit the {} MB cap; replay floor is seq {}\"",
+            cap_out.sessions,
+            cap_out.routing,
+            cap_out.events,
+            cfg.max_db_mb,
+            cap_out.floor_seq.map(|v| v.to_string()).unwrap_or_else(|| "null".into())
+        );
+        core.emit("gap", None, false, &body);
+    }
+    if expired_events + expired_sessions > 0 {
+        let body = format!(
+            ",\"reason\":\"retention_expiry\",\"bytes\":0,\"records_unattributed\":0,\"detail\":\"{} event(s) and {} session(s) older than {} day(s) were deleted; replay floor is seq {}\"",
+            expired_events,
+            expired_sessions,
+            cfg.retention_days,
+            core.store.as_ref().and_then(|st| st.retention_floor().0).map(|v| v.to_string()).unwrap_or_else(|| "null".into())
+        );
+        core.emit("gap", None, false, &body);
+    }
 
     // Resume seq from storage so seq stays monotonic across restarts.
     if let Some(st) = core.store.as_ref() {

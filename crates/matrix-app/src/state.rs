@@ -240,6 +240,14 @@ pub struct Status {
     pub sub_replayed: i64,
     pub sub_replay_truncated: i64,
     pub sub_bytes_out: i64,
+    // retention cut advertised by the collector: the replay floor is bounded
+    // by it, so the UI can say why a reconnect sees fewer lines than before.
+    pub retention_days: i64,
+    pub retention_floor_seq: Option<i64>,
+    pub retention_expired_events: i64,
+    pub retention_bounded: bool,
+    pub retention_max_db_mb: i64,
+    pub retention_size_evicted: i64,
 }
 
 /// Where the compositor actually put the window (read back from hyprctl, never
@@ -1259,6 +1267,12 @@ impl State {
                     discarded_passes: v.get("discarded_passes").and_then(|z| z.as_i64()).unwrap_or(0),
                     gap_bytes_total: v.get("gap_bytes_total").and_then(|z| z.as_i64()).unwrap_or(0),
                     replay_max: v.get("replay_max").and_then(|z| z.as_i64()).unwrap_or(0),
+                    retention_days: v.path(&["retention", "days"]).and_then(|z| z.as_i64()).unwrap_or(0),
+                    retention_floor_seq: v.path(&["retention", "floor_seq"]).and_then(|z| z.as_i64()),
+                    retention_expired_events: v.path(&["retention", "expired_events"]).and_then(|z| z.as_i64()).unwrap_or(0),
+                    retention_bounded: matches!(v.path(&["retention", "replay_bounded_by_retention"]), Some(Value::Bool(true))),
+                    retention_max_db_mb: v.path(&["retention", "max_db_mb"]).and_then(|z| z.as_i64()).unwrap_or(0),
+                    retention_size_evicted: v.path(&["retention", "size_evicted_events"]).and_then(|z| z.as_i64()).unwrap_or(0),
                     engine_ok: v.path(&["engine", "ok"]).and_then(|z| match z {
                         Value::Bool(b) => Some(*b),
                         _ => None,
@@ -1337,10 +1351,14 @@ impl State {
                         // attach) is the thing operators care about: the app
                         // lost the socket, came back, and the collector filled
                         // the hole from its store. Count it once per connect.
-                        if e.replayed > 0 && self.connects > 1
-                            && self.replay_counted_connect != self.connects {
+                        // Count the replay that follows a *disconnect* (that is
+                        // what "reconnect" means here), keyed on the disconnect
+                        // count so it fires once and does not depend on whether
+                        // the Connected message was processed before this line.
+                        if e.replayed > 0 && self.disconnects > 0
+                            && self.replay_counted_connect != self.disconnects {
                             self.reconnects_with_replay += 1;
-                            self.replay_counted_connect = self.connects;
+                            self.replay_counted_connect = self.disconnects;
                         }
                         if e.truncated > 0 {
                             self.replay_truncated_seen = e.truncated as u64;
@@ -1872,6 +1890,33 @@ impl State {
                     r.id, json::esc(&r.name), r.depth, r.sent, r.dropped, r.forced, r.replayed, r.truncated, r.closed
                 )).collect::<Vec<_>>().join(","))),
             None => o.push_str("\"status\":null,"),
+        }
+        // retention cut advertised by the collector (Stage 8): the replay floor
+        // is bounded by it, so a reconnect may legitimately see fewer lines.
+        match &self.status {
+            Some(s) => o.push_str(&format!(
+                "\"retention\":{{\"days\":{},\"floor_seq\":{},\"expired_events\":{},\"replay_bounded_by_retention\":{},\"note\":\"replay and export only see rows inside the retention window\"}},",
+                s.retention_days,
+                s.retention_floor_seq.map(|v| v.to_string()).unwrap_or("null".into()),
+                s.retention_expired_events,
+                s.retention_bounded
+            )),
+            None => o.push_str("\"retention\":null,"),
+        }
+        // size-cap half of the retention honesty (Stage 8): max budget and how
+        // many events the overflow hammer removed at startup.
+        match &self.status {
+            Some(s) => {
+                o.push_str("\"retention_size\":{");
+                o.push('"'); o.push_str("max_db_mb"); o.push('"'); o.push(':');
+                o.push_str(&s.retention_max_db_mb.to_string());
+                o.push(',');
+                o.push('"'); o.push_str("size_evicted_events"); o.push('"'); o.push(':');
+                o.push_str(&s.retention_size_evicted.to_string());
+                o.push('}');
+                o.push(',');
+            }
+            None => o.push_str("\"retention_size\":null,"),
         }
 
         o.push_str("\"layer_activation_totals\":[");

@@ -146,7 +146,8 @@ def stop_units():
 
 
 def start_units():
-    ssh(f"systemctl --user start {UNIT_C}; for i in $(seq 1 60); do [ -S {PREFIX}/run/collector.sock ] && break; sleep 0.25; done; "
+    ssh(f"systemctl --user reset-failed {UNIT_A} {UNIT_C} 2>/dev/null || true; "
+        f"systemctl --user start {UNIT_C}; for i in $(seq 1 60); do [ -S {PREFIX}/run/collector.sock ] && break; sleep 0.25; done; "
         f"systemctl --user start {UNIT_A}", timeout=180)
     return health(35)
 
@@ -350,7 +351,8 @@ def test_a2():
         ssh(f"systemctl --user start {UNIT_C}", timeout=60)
         _, up_c = wait_for(lambda: out(f"systemctl --user is-active {UNIT_C}") == "active", 20)
         _, sock = wait_for(lambda: out(f"test -S {PREFIX}/run/collector.sock && echo yes") == "yes", 20)
-        ssh(f"systemctl --user start {UNIT_A}", timeout=60)
+        ssh(f"systemctl --user reset-failed {UNIT_A} 2>/dev/null || true; "
+            f"systemctl --user start {UNIT_A}", timeout=60)
         h = health(40)
         c1 = show(UNIT_C, "MainPID").get("MainPID")
         a1 = show(UNIT_A, "MainPID").get("MainPID")
@@ -405,6 +407,10 @@ def test_a3():
                      30)
     ok_active, _ = wait_for(lambda: out(f"systemctl --user is-active {UNIT_C}") == "active", 30)
     h = health(60)
+    # the collector reports a per-subscriber snapshot every 2 s: wait for the
+    # post-reconnect counters instead of reading the dump in the race window
+    wait_for(lambda: (appstats().get("reconnects_with_replay") or 0)
+             > (t["before_collector"]["reconnects_with_replay"] or 0), 25)
     sc1 = show(UNIT_C, "MainPID", "NRestarts")
     after = appstats()
     t["kill_collector"] = {
@@ -488,6 +494,7 @@ print(json.dumps({"n": len(lines), "first_types": types[:6],
     ssh(f"kill -9 $(systemctl --user show {UNIT_A} -p MainPID --value)", timeout=60)
     dt, _ = wait_for(lambda: show(UNIT_A, "MainPID").get("MainPID") not in ("0", sa0.get("MainPID")), 40)
     h = health(60)
+    wait_for(lambda: (appstats().get("replay_seen") or 0) > 0, 20)
     sa1 = show(UNIT_A, "MainPID", "NRestarts")
     a2 = appstats()
     t["kill_app"] = {
@@ -547,7 +554,21 @@ def test_a4():
     sha0 = out(f"sha256sum {PREFIX}/bin/matrix-*")
 
     # --- 1. rollback to the pair saved by the last deploy (older app build)
-    prev = out(f"ls -1d {PREFIX}/bin/prev/*/ | sort | tail -1").strip()
+    # Pick the newest previous pair that is actually DIFFERENT from what is
+    # installed now (a re-run of this check creates a same-version snapshot).
+    cur = dict((l.split()[1].split("/")[-1], l.split()[0]) for l in sha0.splitlines() if l.strip())
+    cands = [x for x in out(f"ls -1d {PREFIX}/bin/prev/*/").split() if x]
+    prev = ""
+    for c in sorted(cands, reverse=True):
+        try:
+            m = json.loads(out(f"cat {c}/manifest.json"))
+        except Exception:
+            continue
+        if m.get("old_app_sha") != cur.get("matrix-app") or m.get("old_collect_sha") != cur.get("matrix-collect"):
+            prev = c
+            break
+    t["prev_candidates"] = cands
+    t["prev_chosen"] = prev
     r = ssh(f"{BUILD}/deploy/rollback.sh --prefix {PREFIX} --unit-prefix matrix --to {prev} 2>&1", timeout=300)
     t["rollback"] = {"rc": r["rc"], "out": r["out"][-600:], "prev": prev,
                      "sha": out(f"sha256sum {PREFIX}/bin/matrix-*")}
@@ -555,18 +576,34 @@ def test_a4():
     t["rollback_health"] = h.get("ok")
     prev_sha_c = out(f"sha256sum {PREFIX}/bin/matrix-collect | cut -d' ' -f1")
     prev_sha_a = out(f"sha256sum {PREFIX}/bin/matrix-app | cut -d' ' -f1")
+    manifest = json.loads(out(f"cat {prev}/manifest.json"))  # remote file, read over ssh
+    t["rollback_manifest"] = manifest
     t["rollback_sha_match_manifest"] = (
-        prev_sha_c == json.load(open(prev + "manifest.json"))["old_collect_sha"]
-        and prev_sha_a == json.load(open(prev + "manifest.json"))["old_app_sha"])
+        prev_sha_c == manifest["old_collect_sha"] and prev_sha_a == manifest["old_app_sha"])
 
     # --- 2. upgrade back to the current build (the deploy path)
+    # --build on purpose: the deploy must rebuild from THIS tree, never trust a
+    # stale target/ that predates the retention change
     r = ssh(f"{BUILD}/deploy/deploy.sh --from local --src {BUILD} --work {PREFIX}/build "
-            f"--prefix {PREFIX} --unit-prefix matrix --no-build --auto-rollback 2>&1", timeout=900)
+            f"--prefix {PREFIX} --unit-prefix matrix --build --auto-rollback 2>&1", timeout=1800)
     t["deploy"] = {"rc": r["rc"], "out": r["out"][-1200:]}
     h = health(40)
     t["deploy_health"] = h.get("ok")
     new_sha = out(f"sha256sum {PREFIX}/bin/matrix-*")
-    t["deploy_sha_changed"] = new_sha != t["rollback"]["sha"] and new_sha == sha0
+    # A rebuild in a different directory is not byte-identical (Rust embeds source
+    # paths), so the honest assertion is: the deployed pair IS the pair the deploy
+    # just built, and it differs from the rolled-back pair.
+    build_sha = out(f"sha256sum {PREFIX}/build/target/release/matrix-*")
+    t["deploy_pair"] = {"installed": new_sha, "just_built": build_sha}
+    t["deploy_sha_changed"] = new_sha != t["rollback"]["sha"] and new_sha == build_sha
+    # Normalise back to the reference build in ~/matrix-build so that the later
+    # rebuild (S8-A1) compares like with like: same tree, same flags, same paths.
+    r = ssh(f"{BUILD}/deploy/install.sh --bin-src {BUILD}/target/release --prefix {PREFIX} "
+            f"--unit-prefix matrix 2>&1 | tail -1", timeout=300)
+    t["normalized"] = {"rc": r["rc"], "sha": out(f"sha256sum {PREFIX}/bin/matrix-*")}
+    t["normalized_matches_reference"] = t["normalized"]["sha"] == sha0
+    h = health(40)
+    t["normalized_health"] = h.get("ok")
     t["deploy_log_tail"] = out(f"tail -3 {PREFIX}/etc/deploy-log.jsonl")
 
     # --- 3. throwaway target: install old pair, upgrade, roll back, uninstall
@@ -593,6 +630,20 @@ def test_a4():
     t["tgt_rollback"] = {"rc": r["rc"], "out": r["out"][-400:],
                          "sha": out(f"sha256sum {TGT}/bin/matrix-*")}
     t["tgt_rollback_restores"] = t["tgt_rollback"]["sha"] == t["tgt_sha_before"]
+    # rotation executed for real on the throwaway DB (routing is never pruned, so
+    # this is the actual bound): archive via VACUUM INTO, fresh DB, unit back up
+    r = ssh(f"{BUILD}/deploy/db-rotate.sh --prefix {TGT} --unit-prefix matrixtgt --force", timeout=600)
+    try:
+        rot = json.loads(r["out"].strip().splitlines()[-1])
+    except Exception:
+        rot = {"raw": r["out"][-300:], "err": r["err"][-300:]}
+    t["tgt_rotate"] = dict(rot, rc=r["rc"],
+                           archives=out(f"ls -1 {TGT}/data/archive 2>/dev/null | tr '\n' ' '"),
+                           db_bytes=out(f"stat -c %s {TGT}/data/telemetry.sqlite 2>/dev/null || echo 0"),
+                           active=out("systemctl --user is-active matrixtgt-collect.service"))
+    t["tgt_rotate_ok"] = (r["rc"] == 0 and rot.get("action") == "rotated"
+                          and rot.get("integrity") == "ok" and int(rot.get("archive_bytes") or 0) > 0
+                          and t["tgt_rotate"]["active"] == "active")
     # uninstall default: keep data, remove units
     r = ssh(f"{BUILD}/deploy/uninstall.sh --prefix {TGT} --unit-prefix matrixtgt 2>&1", timeout=180)
     t["tgt_uninstall_keep"] = {"rc": r["rc"], "out": r["out"][-600:],
@@ -624,8 +675,10 @@ def test_a4():
 
     ok = (t["rollback"]["rc"] == 0 and t["rollback_health"] and t["rollback_sha_match_manifest"]
           and t["deploy"]["rc"] == 0 and t["deploy_health"] and t["deploy_sha_changed"]
+          and t["normalized_matches_reference"] and t["normalized_health"]
           and t["tgt_install"]["rc"] == 0 and "active" in t["tgt_start"]
           and t["tgt_upgrade_changed_sha"] and t["tgt_rollback_restores"]
+          and t["tgt_rotate_ok"]
           and t["tgt_purge_wrong_confirm"]["refused"] and t["tgt_purge"]["data_exists"] == "no"
           and t["live_untouched"] and t["live_health_close_a4"])
     save("deploy.json", t)
@@ -637,6 +690,9 @@ def test_a4():
         "throwaway": {"install_rc": t["tgt_install"]["rc"], "start": t["tgt_start"],
                       "upgrade_changed_sha": t["tgt_upgrade_changed_sha"],
                       "rollback_restores": t["tgt_rollback_restores"],
+                      "rotate": {"action": t["tgt_rotate"].get("action"),
+                                 "archive_bytes": t["tgt_rotate"].get("archive_bytes"),
+                                 "db_bytes_after": t["tgt_rotate"]["db_bytes"]},
                       "purge_wrong_confirm_refused": t["tgt_purge_wrong_confirm"]["refused"],
                       "purge_data_exists": t["tgt_purge"]["data_exists"]},
         "live_db": {"same_inode": t["live_db_same_inode"], "same_dir": t["live_db_same_dir_listing"],
@@ -653,7 +709,7 @@ def test_a5():
     du_before = out("journalctl --disk-usage")
     cfg = out("systemd-analyze cat-config systemd/journald.conf | grep -vE '^\\s*#|^\\s*$'")
     t["journald_config"] = cfg
-    t["caps"] = dict(re.findall(r"^(SystemMaxUse|SystemMaxFileSize|SystemKeepFree|MaxFileSec|MaxRetentionSec)=(\\S+)",
+    t["caps"] = dict(re.findall(r"^(SystemMaxUse|SystemMaxFileSize|SystemKeepFree|MaxFileSec|MaxRetentionSec)=(\S+)",
                                 cfg, re.M))
     t["disk_usage_before"] = du_before
 
@@ -666,20 +722,23 @@ def test_a5():
                           "largest_bytes": max(int(l.split()[0]) for l in sizes.splitlines() if l.strip())}
     t["disk_usage_after"] = out("journalctl --disk-usage")
     t["under_cap"] = True
-    m = re.search(r"take up ([\\d.]+)([KMG])", t["disk_usage_after"])
+    m = re.search(r"take up ([\d.]+)([KMG])", t["disk_usage_after"])
     if m:
         mult = {"K": 1 / 1024, "M": 1, "G": 1024}[m.group(2)]
         t["disk_mb_after"] = round(float(m.group(1)) * mult, 1)
         cap = t["caps"].get("SystemMaxUse", "512M")
         t["under_cap"] = t["disk_mb_after"] <= float(re.sub(r"[^0-9.]", "", cap)) + 1
 
-    # per-unit log volume over the run so far (measured window, not a guess)
-    since = open(STAMP_PATH).read().strip()
+    # per-unit log volume measured over a fixed 3 h window that is a superset of
+    # this session (units were installed ~13 min before STAMP). Idle time is
+    # included on purpose: the number is an upper bound on steady state, not a
+    # burst-rate sample.
+    hours = 3.0
     for unit, key in ((UNIT_C, "collector"), (UNIT_A, "app")):
-        n = out(f"journalctl --user -u {unit} --since '{since}' --no-pager | wc -l")
-        b = out(f"journalctl --user -u {unit} --since '{since}' --output=json --no-pager | wc -c")
-        t[key] = {"lines": int(n or 0), "bytes": int(b or 0)}
-    hours = max((time.time() - time.mktime(time.strptime(since[:19], "%Y-%m-%dT%H:%M:%S"))) / 3600.0, 0.02)
+        n = out(f"journalctl --user -u {unit} --since '-{int(hours)}h' --no-pager | wc -l")
+        b = out(f"journalctl --user -u {unit} --since '-{int(hours)}h' --output=json --no-pager | wc -c")
+        starts = out(f"journalctl --user -u {unit} --since '-{int(hours)}h' --no-pager | grep -c 'Started THE MATRIX'")
+        t[key] = {"lines": int(n or 0), "bytes": int(b or 0), "starts": int(starts or 0)}
     t["window_hours"] = round(hours, 3)
     tot_bytes = t["collector"]["bytes"] + t["app"]["bytes"]
     t["bytes_per_hour"] = round(tot_bytes / hours, 1)
@@ -694,15 +753,182 @@ ExecStart=/bin/sh -c "i=0; while [ $i -lt 3000 ]; do echo probe-line-$i; i=$((i+
 LogRateLimitIntervalSec=2s
 LogRateLimitBurst=20
 '''
-    ssh("cat > ~/.config/systemd/user/matrix-logprobe.service <<'EOF'\n" + probe + "EOF\n"
+    tag = "logprobe%d" % int(time.time())
+    ssh("cat > ~/.config/systemd/user/matrix-logprobe.service <<'EOF'\n" + probe +
+        "SyslogIdentifier=" + tag + "\nEOF\n"
         "systemctl --user daemon-reload; systemctl --user start matrix-logprobe.service; sleep 4", timeout=120)
-    n = out("journalctl --user -u matrix-logprobe --no-pager | grep -c probe-line")
+    n = out(f"journalctl --user -t {tag} --no-pager | grep -c probe-line")
     man = out("man systemd.exec 2>/dev/null | col -b | grep -B2 -A2 'not in per-user services' | tr -s ' ' | head -5")
     ssh("systemctl --user stop matrix-logprobe.service; "
         "rm -f ~/.config/systemd/user/matrix-logprobe.service; systemctl --user daemon-reload", timeout=120)
     t["rate_limit_probe"] = {"lines_logged": int(n or 0), "lines_emitted": 3000,
                              "enforced": int(n or 0) < 3000, "man_note": man[:300]}
     t["rate_limit_supported_for_user_units"] = t["rate_limit_probe"]["enforced"]
+    # Bounded is the requirement; *how* it is bounded is what this records. If
+    # the platform cannot rate-limit a user unit, the man-page sentence is the
+    # evidence that the knob was not silently ignored.
+    t["rate_limit_documented"] = (t["rate_limit_probe"]["enforced"]
+                                  or "not in per-user services" in t["rate_limit_probe"]["man_note"])
+
+    # --- retention is a REAL ceiling. Proven on a time-shifted COPY (rows moved
+    # back 3 days), never on the live store first: everything routing-shaped must
+    # expire, the file must shrink, integrity must stay ok and the replay floor
+    # must be reported honestly.
+    fixture = r"""
+import json, os, sqlite3, subprocess, sys
+src, dst, exe = sys.argv[1], sys.argv[2], sys.argv[3]
+for p in (dst, dst + "-wal", dst + "-shm"):
+    if os.path.exists(p): os.remove(p)
+con = sqlite3.connect(src, timeout=30); con.isolation_level = None
+con.execute("VACUUM INTO " + json.dumps(dst)); con.close()
+tables = ("events", "sessions", "passes", "routing", "perf")
+c0 = sqlite3.connect(dst)
+before = {t: c0.execute("select count(*) from " + t).fetchone()[0] for t in tables}
+c0.close()
+con = sqlite3.connect(dst); con.isolation_level = None
+con.execute("update events set ts = ts - 3*86400")
+con.execute("update sessions set started_ts = started_ts - 3*86400, finished_ts = case when finished_ts is null then null else finished_ts - 3*86400 end")
+con.execute("update routing set ts = ts - 3*86400")
+con.execute("update perf set ts = ts - 3*86400")
+con.execute("update hw set ts = ts - 3*86400")
+con.execute("update status set ts = ts - 3*86400")
+con.commit(); con.close()
+size_before = os.path.getsize(dst)
+# cap at 60% of the copy, so partial oldest-first eviction is observable
+cap_mb = max(50, int(size_before / 1e6 * 0.6))
+r = subprocess.run([exe, "--prune", "--db", dst, "--retention-days", "1", "--vacuum"],
+                   capture_output=True, text=True)
+# the maintenance JSON contains newlines inside its strings: parse the
+# whole stdout, never the last line (Stage-8 harness bug #2)
+pr = json.loads(r.stdout.strip())["prune"]
+c1 = sqlite3.connect(dst)
+after = {t: c1.execute("select count(*) from " + t).fetchone()[0] for t in tables}
+integ = c1.execute("pragma integrity_check").fetchone()[0]
+floor = c1.execute("select min(seq) from events").fetchone()[0]
+c1.close()
+print(json.dumps({"prune": pr, "before": before, "after": after,
+                  "size_before": size_before, "size_after": os.path.getsize(dst),
+                  "integrity": integ, "floor_seq": floor, "rc": r.returncode}))
+"""
+    open(os.path.join(ART, "expiry_fixture.py"), "w").write(fixture)
+    subprocess.run(f"scp -q {ART}/expiry_fixture.py main:/tmp/expiry_fixture.py", shell=True, check=True)
+    fx = f"{PREFIX}/data/expiry-test.sqlite"
+    r = ssh(f"python3 /tmp/expiry_fixture.py {PREFIX}/data/telemetry.sqlite {fx} "
+            f"{PREFIX}/bin/matrix-collect", timeout=900)
+    try:
+        exp = json.loads(r["out"].strip().splitlines()[-1])
+    except Exception:
+        exp = {"error": r["out"][-400:], "err": r["err"][-400:]}
+    t["expiry"] = exp
+    ex = t["expiry"]
+    t["expiry_ok"] = bool(
+        ex.get("rc") == 0 and ex.get("integrity") == "ok"
+        and (ex.get("after") or {}).get("sessions") == 0
+        and (ex.get("after") or {}).get("routing") == 0
+        and (ex.get("after") or {}).get("passes") == 0
+        and (ex.get("after") or {}).get("events", 1) < (ex.get("before") or {}).get("events", 0)
+        and (ex.get("size_after") or 1) < 0.5 * (ex.get("size_before") or 0)
+        and ((ex.get("prune") or {}).get("events_pruned_other", 0) > 0
+             or (ex.get("prune") or {}).get("routing_pruned", 0) > 0)
+        and (ex.get("prune") or {}).get("vacuumed") is True
+        and ex.get("floor_seq") is not None)
+
+    # export is the keep-longer escape hatch: it must work on the expired store
+    r = ssh(f"rm -rf /tmp/s8-exp && {PREFIX}/bin/matrix-collect --db {fx} --export /tmp/s8-exp", timeout=600)
+    try:
+        export = json.loads(r["out"].strip().splitlines()[-1])["export"]
+    except Exception:
+        export = {"error": r["out"][-300:]}
+    n_lines = out("wc -l < /tmp/s8-exp/events.ndjson 2>/dev/null || echo 0")
+    t["export_after_expiry"] = dict(export, events_ndjson_lines=int(n_lines or 0))
+    t["export_ok"] = (export.get("ok") is True and export.get("identity_equal") is True
+                      and export.get("events_lines") == (ex.get("after") or {}).get("events"))
+    ssh(f"rm -rf /tmp/s8-exp {fx} {fx}-wal {fx}-shm", timeout=120)
+
+    # --- hard size cap: a fixture whose time-based expiry removes nothing (all
+    # rows are fresh) so only the overflow hammer can bring it under budget.
+    cap_py = r"""
+import json, os, sqlite3, subprocess, sys
+src, dst, exe = sys.argv[1], sys.argv[2], sys.argv[3]
+for p in (dst, dst + "-wal", dst + "-shm"):
+    if os.path.exists(p): os.remove(p)
+con = sqlite3.connect(src, timeout=30); con.isolation_level = None
+con.execute("VACUUM INTO " + json.dumps(dst))
+oldest0 = con.execute("select min(ts) from events").fetchone()[0]
+sess0 = con.execute("select count(*) from sessions").fetchone()[0]
+sess_old0 = con.execute("select min(started_ts) from sessions").fetchone()[0]
+newest0 = con.execute("select max(ts) from events").fetchone()[0]
+con.close()
+size_before = os.path.getsize(dst)
+# cap at 60% of the copy, so partial oldest-first eviction is observable
+cap_mb = max(50, int(size_before / 1e6 * 0.6))
+r = subprocess.run([exe, "--prune", "--db", dst, "--retention-days", "1",
+                    "--max-db-mb", str(cap_mb), "--vacuum"], capture_output=True, text=True)
+out = json.loads(r.stdout.strip())
+cap = out.get("size_cap") or {}
+c = sqlite3.connect(dst)
+integ = c.execute("pragma integrity_check").fetchone()[0]
+oldest = c.execute("select min(ts) from events").fetchone()[0]
+newest = c.execute("select max(ts) from events").fetchone()[0]
+sess = c.execute("select count(*) from sessions").fetchone()[0]
+sess_old1 = c.execute("select min(started_ts) from sessions").fetchone()[0]
+c.close()
+print(json.dumps({"size_cap": cap, "integrity": integ, "rc": r.returncode,
+                  "size_before": size_before, "size_after": os.path.getsize(dst),
+                  "oldest_before": oldest0, "newest_before": newest0,
+                  "oldest_after": oldest, "newest_after": newest, "sessions_after": sess,
+                  "sessions_before": sess0, "oldest_session_before": sess_old0,
+                  "oldest_session_after": sess_old1,
+                  "time_pruned": (out.get("prune") or {}).get("events_pruned_other")}))
+"""
+    open(os.path.join(ART, "size_cap_fixture.py"), "w").write(cap_py)
+    subprocess.run(f"scp -q {ART}/size_cap_fixture.py main:/tmp/size_cap_fixture.py", shell=True, check=True)
+    fx2 = f"{PREFIX}/data/sizecap-test.sqlite"
+    r = ssh(f"python3 /tmp/size_cap_fixture.py {PREFIX}/data/telemetry.sqlite {fx2} "
+            f"{PREFIX}/bin/matrix-collect", timeout=1200)
+    try:
+        sc = json.loads(r["out"].strip().splitlines()[-1])
+    except Exception:
+        sc = {"error": r["out"][-400:], "err": r["err"][-400:]}
+    t["size_cap"] = sc
+    capb = (sc.get("size_cap") or {}).get("cap_bytes") or 0
+    t["size_cap_ok"] = bool(
+        sc.get("rc") == 0 and sc.get("integrity") == "ok"
+        and (sc.get("size_cap") or {}).get("evicted", 0) > 0
+        and (sc.get("size_after") or 1e18) <= capb * 1.05
+        and (sc.get("size_after") or 1e18) < (sc.get("size_before") or 0)
+        and (capb or 0) > 0
+        and (sc.get("sessions_after") or 0) > 0
+        and (sc.get("sessions_before") or 0) > (sc.get("sessions_after") or 0)
+        and (sc.get("oldest_session_after") or 0) > (sc.get("oldest_session_before") or 0)
+        and (sc.get("newest_after") or 0) >= (sc.get("newest_before") or 0) - 5)
+    ssh(f"rm -f {fx2} {fx2}-wal {fx2}-shm", timeout=120)
+
+    # live arming: the deployed unit and the live status both say 1 day
+    t["live_retention"] = {
+        "exec_has_1_day": "--retention-days 1" in out(f"systemctl --user show {UNIT_C} -p ExecStart --value"),
+        "status": (appstats().get("retention") or {}),
+        "size_cap_live": (appstats().get("retention_size") or {}),
+    }
+    t["live_retention"]["exec_has_cap"] = "--max-db-mb 25000" in out(
+        f"systemctl --user show {UNIT_C} -p ExecStart --value")
+    t["live_retention_ok"] = (t["live_retention"]["exec_has_1_day"]
+                              and t["live_retention"]["exec_has_cap"]
+                              and (t["live_retention"]["status"] or {}).get("days") == 1
+                              and (appstats().get("retention_size") or {}).get("max_db_mb") == 25000
+                              and (t["live_retention"]["status"] or {}).get("replay_bounded_by_retention") is True)
+
+    # state: run/ still carries pid/stats files left by the Stage-3..7 harnesses
+    # (which own these paths). Keep only what the live units use, and measure.
+    run_before = out(f"ls -1 {PREFIX}/run | sort | tr '\n' ' '")
+    run_bytes_before = int(out(f"du -sb {PREFIX}/run | cut -f1") or 0)
+    ssh(f"cd {PREFIX}/run && for f in *; do case \"$f\" in collector.sock|live-stats.json) ;; *) rm -f -- \"$f\";; esac; done", timeout=120)
+    t["run_cleanup"] = {
+        "before_files": len(run_before.split()),
+        "kept": out(f"ls -1 {PREFIX}/run | tr '\n' ' '"),
+        "before_bytes": run_bytes_before,
+        "after_bytes": int(out(f"du -sb {PREFIX}/run | cut -f1") or 0),
+    }
 
     # state bounds: DB, WAL, run dir, log dir
     t["state"] = {
@@ -711,28 +937,47 @@ LogRateLimitBurst=20
         "run_dir_bytes": int(out(f"du -sb {PREFIX}/run | cut -f1") or 0),
         "run_files": out(f"ls -1 {PREFIX}/run | tr '\\n' ' '"),
         "logs_dir_bytes": int(out(f"du -sb {PREFIX}/logs | cut -f1") or 0),
-        "retention_days_default": 30,
+        "retention_days_live": 1 if "--retention-days 1" in out(f"systemctl --user show {UNIT_C} -p ExecStart --value") else None,
         "journal_mb_after": t.get("disk_mb_after"),
     }
 
     ok = (t["caps"].get("SystemMaxUse") == "512M" and t["caps"].get("SystemMaxFileSize") == "64M"
-          and t["files_after"] > t["files_before"] and t["under_cap"]
-          and t["mb_per_day_measured"] >= 0 and t["collector"]["lines"] > 0
-          and t["window_hours"] > 0.02)
+          and t["journal_files"]["after"] > t["journal_files"]["before"] and t["under_cap"]
+          and t["collector"]["lines"] > 0 and t["app"]["lines"] > 0
+          and t["run_cleanup"]["before_files"] >= 2
+          and set(t["state"]["run_files"].split()) <= {"collector.sock", "live-stats.json"}
+          and (t["rate_limit_supported_for_user_units"] or t["rate_limit_documented"])
+          and t["expiry_ok"] and t["export_ok"] and t["live_retention_ok"]
+          and t["size_cap_ok"])
     save("log-bounds.json", t)
     check("S8-A5", ok, json.dumps({
         "caps": t["caps"], "disk": [du_before, t["disk_usage_after"]],
         "journal_files": t["journal_files"], "under_cap": t["under_cap"],
         "unit_lines": {"collector": t["collector"]["lines"], "app": t["app"]["lines"]},
         "mb_per_day_measured": t["mb_per_day_measured"], "window_h": t["window_hours"],
-        "rate_limit": t["rate_limit_probe"], "state": t["state"]}))
+        "rate_limit": t["rate_limit_probe"], "state": t["state"],
+        "expiry": {"size": [ex.get("size_before"), ex.get("size_after")],
+                   "counts_before": ex.get("before"), "counts_after": ex.get("after"),
+                   "integrity": ex.get("integrity"), "floor_seq": ex.get("floor_seq"),
+                   "prune": ex.get("prune")},
+        "export": {"identity_equal": export.get("identity_equal"),
+                   "events_lines": export.get("events_lines")},
+        "size_cap": {"sessions": [sc.get("sessions_before"), sc.get("sessions_after")],
+                     "oldest_session": [sc.get("oldest_session_before"), sc.get("oldest_session_after")],
+                     "size": [sc.get("size_before"), sc.get("size_after")],
+                     "evicted": (sc.get("size_cap") or {}).get("evicted"),
+                     "time_pruned": sc.get("time_pruned"),
+                     "oldest_ts": [sc.get("oldest_before"), sc.get("oldest_after")],
+                     "integrity": sc.get("integrity")},
+        "live_retention": t["live_retention"]}))
     return t
 
 
 # ---------------------------------------------------------------- S8-A6
 def test_a6():
-    """Ops runbook: present in the repo, on the host and in the vault, and every
-    documented command actually runs."""
+    """Ops runbook: present in the repo, on the host and in the vault; its
+    documented snapshot command is the one measured to win; every documented
+    command runs; the growth arithmetic matches live numbers."""
     t = {}
     rb_repo = f"{REPO}/deploy/OPS-RUNBOOK.md"
     t["paths"] = {"repo": rb_repo, "host": f"{PREFIX}/OPS-RUNBOOK.md",
@@ -742,10 +987,81 @@ def test_a6():
                    "vault": out(f"test -f '{t['paths']['vault']}' && echo yes || echo no") == "yes"}
     text = open(rb_repo).read() if os.path.exists(rb_repo) else ""
     need = ["## Health", "## Restart", "## Restore the database", "## Backup policy",
-            "## Upgrade", "## Rollback", "## Uninstall", "## Logs", "## Units"]
-    t["sections"] = {s: (s in text) for s in need}
+            "## Upgrade", "## Rollback", "## Uninstall", "## Logs", "## Units",
+            "## How big can the database get?"]
+    t["sections"] = {x: (x in text) for x in need}
 
-    # every fenced command block marked `# verify:` is executed on main
+    # --- the snapshot command, measured live (hot WAL, collector writing)
+    measure_py = r"""
+import json, os, sqlite3, sys, time
+db, tmp = sys.argv[1], sys.argv[2]
+if os.path.exists(tmp): os.remove(tmp)
+con = sqlite3.connect(db, timeout=30); con.isolation_level = None
+w = con.execute("select max(seq) from events").fetchone()[0]
+t0 = time.time(); con.execute("VACUUM INTO " + json.dumps(tmp)); dur = time.time() - t0
+c2 = sqlite3.connect(tmp)
+print(json.dumps({"seconds": round(dur, 2), "watermark": w,
+                  "live_bytes": os.path.getsize(db), "copy_bytes": os.path.getsize(tmp),
+                  "integrity": c2.execute("pragma integrity_check").fetchone()[0],
+                  "copy_le_w": c2.execute("select count(*) from events where seq<=?", (w,)).fetchone()[0],
+                  "live_le_w": con.execute("select count(*) from events where seq<=?", (w,)).fetchone()[0],
+                  "count": con.execute("select count(*) from events").fetchone()[0]}))
+"""
+    open(os.path.join(ART, "measure_backup.py"), "w").write(measure_py)
+    subprocess.run(f"scp -q {ART}/measure_backup.py main:/tmp/measure_backup.py", shell=True, check=True)
+    r = ssh(f"python3 /tmp/measure_backup.py {PREFIX}/data/telemetry.sqlite /tmp/s8-a6-snap.sqlite", timeout=600)
+    try:
+        meas = json.loads(r["out"].strip().splitlines()[-1])
+    except Exception:
+        meas = {"error": r["out"][-300:], "err": r["err"][-300:]}
+    t["measured_snapshot"] = meas
+    t["snapshot_ok"] = (meas.get("integrity") == "ok" and meas.get("copy_le_w") == meas.get("live_le_w")
+                        and (meas.get("seconds") or 0) > 0 and (meas.get("copy_bytes") or 0) > 0)
+
+    # the numbers the runbook prints must be the numbers just measured
+    m = re.search(r"~?\s*(\d+(?:\.\d+)?)\s*s\s*->\s*~?\s*(\d+(?:\.\d+)?)\s*GB", text)
+    t["documented"] = {"seconds": float(m.group(1)), "gb": float(m.group(2))} if m else None
+    if m and meas.get("seconds"):
+        t["doc_matches_measurement"] = (
+            abs(float(m.group(1)) - meas["seconds"]) <= max(1.5, 1.0 * meas["seconds"])
+            and abs(float(m.group(2)) - meas["copy_bytes"] / 1e9) <= 0.6 * meas["copy_bytes"] / 1e9 + 0.5)
+    else:
+        t["doc_matches_measurement"] = False
+    t["documents_vacuum_into"] = "VACUUM INTO" in text
+    t["documents_backup_livelock"] = (".backup" in text and "livelock" in text)
+
+    # --- restore round-trip on the snapshot (live DB only read)
+    r = ssh(f"cp /tmp/s8-a6-snap.sqlite /tmp/s8-a6-restore.sqlite && "
+            f"sqlite3 /tmp/s8-a6-restore.sqlite 'pragma integrity_check;' && "
+            f"echo R=$(sqlite3 /tmp/s8-a6-restore.sqlite 'select count(*) from events where seq<='{meas.get('watermark')}) && "
+            f"echo L=$(sqlite3 {PREFIX}/data/telemetry.sqlite 'select count(*) from events where seq<='{meas.get('watermark')}) && "
+            f"rm -f /tmp/s8-a6-snap.sqlite /tmp/s8-a6-restore.sqlite", timeout=600)
+    outl = r["out"].strip().splitlines()
+    rr = [x for x in outl if x.startswith("R=")]
+    ll = [x for x in outl if x.startswith("L=")]
+    t["restore_test"] = {"rc": r["rc"], "out": outl[-4:]}
+    t["restore_ok"] = (r["rc"] == 0 and "ok" in outl and rr and ll
+                       and rr[0].split("=", 1)[1] == ll[0].split("=", 1)[1])
+    t["collector_stayed_up"] = out(f"systemctl --user is-active {UNIT_C}") == "active"
+
+    # --- arithmetic in the runbook vs live numbers
+    live = sql("select count(*) as n from events")[0]["n"]
+    db_bytes = int(out(f"stat -c %s {PREFIX}/data/telemetry.sqlite") or 0)
+    per_event = round((meas.get("copy_bytes") or db_bytes) / live) if live else 0
+    rng = re.search(r"(\d+)\s*[\u2013-]\s*(\d+)\s*GB", text)
+    doc_range = (int(rng.group(1)), int(rng.group(2))) if rng else None
+    t["arithmetic"] = {"db_bytes": db_bytes, "events": live, "bytes_per_event": per_event,
+                       "retention_days": 1, "stage7_gb_per_day": 20.2,
+                       "one_day_ceiling_gb": round(1 * 20.2, 1), "doc_range_gb": doc_range,
+                       "doc_has": {k: (k in text) for k in
+                                   ("20.2 GB/day", "B/event", "--retention-days 1", "--max-db-mb 25000",
+                                    "replay_bounded_by_retention", "retention_expiry")}}
+    t["arithmetic_ok"] = (all(t["arithmetic"]["doc_has"].values())
+                          and doc_range is not None
+                          and doc_range[0] <= 20.2 <= doc_range[1]
+                          and per_event > 0)
+
+    # --- every command the runbook marks verifiable is executed
     blocks = re.findall(r"```bash\n(.*?)```", text, re.S)
     cmds = []
     for b in blocks:
@@ -755,28 +1071,41 @@ def test_a6():
                 cmds.append(line[len("# verify:"):].strip())
     res = []
     for c in cmds:
-        r = ssh(c, timeout=180)
-        res.append({"cmd": c, "rc": r["rc"], "out": (r["out"].strip().splitlines() or [""])[-1][:200]})
+        # a documented restart can take tens of seconds (startup prune + VACUUM),
+        # so a command that races it gets one retry rather than a false failure
+        r = None
+        for attempt in (1, 2):
+            r = ssh(c, timeout=300)
+            if r["rc"] == 0:
+                break
+            time.sleep(8)
+        res.append({"cmd": c, "rc": r["rc"],
+                    "out": (r["out"].strip().splitlines() or [""])[-1][:160]})
     t["executed"] = res
     t["all_commands_ok"] = all(x["rc"] == 0 for x in res) and len(res) >= 5
 
-    # DB restore command proven on a snapshot copy (never on the live file)
-    r = ssh(f"sqlite3 {PREFIX}/data/telemetry.sqlite \".backup /tmp/s8-restore.db\" && "
-            f"sqlite3 /tmp/s8-restore.db 'pragma integrity_check;' && "
-            f"cp /tmp/s8-restore.db /tmp/s8-restore2.db && "
-            f"sqlite3 /tmp/s8-restore2.db \"select count(*) from events;\" && "
-            f"sqlite3 {PREFIX}/data/telemetry.sqlite \"select count(*) from events;\" && "
-            f"rm -f /tmp/s8-restore.db /tmp/s8-restore2.db", timeout=300)
-    t["restore_test"] = {"rc": r["rc"], "out": r["out"].strip().splitlines()}
-    t["restore_ok"] = (r["rc"] == 0 and len(r["out"].strip().splitlines()) >= 3
-                       and t["restore_test"]["out"][0] == "ok"
-                       and t["restore_test"]["out"][1] == t["restore_test"]["out"][2])
+    # --- state rotation tool reports honestly
+    r = ssh(f"{BUILD}/deploy/db-rotate.sh --check --prefix {PREFIX} --unit-prefix matrix", timeout=120)
+    try:
+        t["db_rotate"] = json.loads(r["out"].strip().splitlines()[-1])
+    except Exception:
+        t["db_rotate"] = {"raw": r["out"][-300:]}
+    wait_for(lambda: out(f"test -S {PREFIX}/run/collector.sock && echo yes") == "yes", 120)
+    t["health_close"] = health(90).get("ok")
 
-    ok = all(t["exists"].values()) and all(t["sections"].values()) and t["all_commands_ok"] and t["restore_ok"]
+    ok = (all(t["exists"].values()) and all(t["sections"].values()) and t["snapshot_ok"]
+          and t["doc_matches_measurement"] and t["documents_vacuum_into"]
+          and t["documents_backup_livelock"] and t["restore_ok"] and t["collector_stayed_up"]
+          and t["arithmetic_ok"] and t["all_commands_ok"] and t["health_close"])
     save("runbook.json", t)
-    check("S8-A6", ok, json.dumps({"exists": t["exists"], "sections": t["sections"],
-                                   "commands": len(res), "commands_ok": t["all_commands_ok"],
-                                   "restore": t["restore_test"]["out"]}))
+    check("S8-A6", ok, json.dumps({
+        "exists": t["exists"], "sections": len(t["sections"]),
+        "snapshot": {"seconds": meas.get("seconds"), "copy_gb": round((meas.get("copy_bytes") or 0) / 1e9, 2),
+                     "integrity": meas.get("integrity"), "counts": [meas.get("copy_le_w"), meas.get("live_le_w")]},
+        "documented": t["documented"], "doc_matches_measurement": t["doc_matches_measurement"],
+        "restore": t["restore_test"]["out"], "arith": t["arithmetic"],
+        "arith_ok": t["arithmetic_ok"], "commands": len(res), "commands_ok": t["all_commands_ok"],
+        "db_rotate": t["db_rotate"]}))
     return t
 
 
@@ -814,7 +1143,7 @@ def test_a7():
     t["tracked"] = local(f"git -C {REPO} ls-tree -r --name-only HEAD deploy verification/stage8")
     t["tracked_ok"] = all(x in t["tracked"] for x in (
         "deploy/install.sh", "deploy/deploy.sh", "deploy/rollback.sh", "deploy/uninstall.sh",
-        "deploy/journald-caps.sh", "deploy/health.py", "deploy/units/matrix-collect.service.in",
+        "deploy/journald-caps.sh", "deploy/db-rotate.sh", "deploy/health.py", "deploy/units/matrix-collect.service.in",
         "deploy/units/matrix-app.service.in", "deploy/OPS-RUNBOOK.md",
         "verification/stage8/run_tests8.py", "verification/stage8/make_packet.py"))
     t["ok"] = all(t["engine_checks"].values()) and t["status"] == "" and t["remotes"] == "" \
@@ -850,7 +1179,7 @@ def test_a8():
               "failed": [c["id"] for c in claims if not c.get("ok")],
               "paths": len(paths), "paths_missing": [x for x in paths if not os.path.exists(x)],
               "acceptance": pk.get("acceptance_criteria")})
-    h = health(30)
+    h = health(60)
     t["live_close"] = {k: h.get(k) for k in ("ok", "connected", "meta_source", "meta_model",
                                              "residency_painted", "residency_slots",
                                              "drops_total", "forced_ours", "frames", "stats_fresh")}

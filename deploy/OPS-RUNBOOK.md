@@ -104,12 +104,27 @@ rm -f ~/the-matrix/data/telemetry.sqlite-wal ~/the-matrix/data/telemetry.sqlite-
 systemctl --user start matrix-collect.service
 ```
 
-A consistent snapshot without stopping anything (`.backup` is safe on a live
-WAL database — this is how the backups below are made):
+**The documented snapshot command is `VACUUM INTO`.** It writes one consistent
+online copy in a single read transaction and does not contend with the
+collector's writes. Measured on the live database (~2 GB, collector running, 2026-10-31):
+
+```
+$ sqlite3 ~/the-matrix/data/telemetry.sqlite "VACUUM INTO '/tmp/telemetry-snap.sqlite'"
+~2 s    ->  ~2.0 GB copy,  pragma integrity_check = ok,  event count identical
+            at the watermark recorded before the copy (3,074,482 == 3,074,482)
+```
+
+`sqlite3 .backup` is **not** the documented command here: against the hot WAL
+database the backup API restarts page-by-page whenever the collector commits
+(1–2 rows/s) and livelocks — measured in Stage 8 at 890 GB of reads on the same ~2 GB file before it was killed. Copying `.db` + `-wal` by hand is never
+acceptable (torn WAL copies are how corrupt restores are born).
+
+Snapshot, no downtime:
 
 ```bash
-sqlite3 ~/the-matrix/data/telemetry.sqlite ".backup /tmp/telemetry-snap.sqlite"
+sqlite3 ~/the-matrix/data/telemetry.sqlite "VACUUM INTO '/tmp/telemetry-snap.sqlite'"
 sqlite3 /tmp/telemetry-snap.sqlite "pragma integrity_check;"   # expect: ok
+# verify: rm -f /tmp/s8-verify.sqlite && sqlite3 /home/main/the-matrix/data/telemetry.sqlite "VACUUM INTO '/tmp/s8-verify.sqlite'" && sqlite3 /tmp/s8-verify.sqlite "pragma integrity_check;" && rm -f /tmp/s8-verify.sqlite
 ```
 
 ```bash
@@ -123,6 +138,61 @@ covers them, WAL checkpointed by SQLite. To reclaim space after a prune:
 `sqlite3 telemetry.sqlite "vacuum;"` (needs ~2× the file size free).
 
 ---
+
+## How big can the database get?
+
+`--retention-days` is a **real ceiling**, not a hw/status-only prune. At startup
+the collector deletes everything older than the window — `passes`, `sessions`,
+`routing`/expert lines, `perf` samples and the emitted event lines — then
+`VACUUM`s the freed pages back to the filesystem. The deployed unit runs with:
+
+```
+--retention-days 1
+```
+
+Only `meta`, `gap` and `residency_estimate` lines are kept beyond the window:
+they are a few hundred bytes per collector run and they are the audit trail that
+explains restarts and replay floors.
+
+**Steady-state ceiling (arithmetic, not vibes):**
+
+| duty | measured rate | 1-day ceiling |
+|---|---|---|
+| extreme (Stage-7 soak: 45 tok/s continuous) | 20.2 GB/day measured; 34.8 GB/day with line-cache compaction; 119 GB/day if nothing were compacted | **20–35 GB** |
+| this host's observed day (mixed load, includes the 62-min soak): 3.3 M events, ~1 GB of NDJSON | 1-2 GB on disk (**~320-630 B/event**, depending on how recently it was VACUUM'd) | **1-2 GB** |
+| quiet day | a fraction of the above | < 1 GB |
+
+**The hard bound is `--max-db-mb 25000` (25 GB):** if the 1-day window still
+leaves the file over budget, the oldest sessions are evicted until it fits
+(oldest-first, then VACUUM), and the app sees `retention_size` plus a
+`retention_size_evict` gap event. So the designed ceiling is
+`max(1-day volume, 25 GB)` — with 35 GB free that is a budget, not luck.
+`db-rotate.sh` remains as a manual, archive-preserving option (run it before
+the file passes ~8 GB, or run long generation sessions with `--no-persist`).
+
+**Honesty consequences of a 1-day window:**
+
+* the **replay floor moves**: after a restart, the collector replays only what
+  is inside the window, so a client that reconnects more than a day later gets
+  fewer replayed lines than before. `telemetry_status.retention` carries
+  `days`, `cutoff_ts`, `floor_seq`, `oldest_ts`, `expired_events` and
+  `replay_bounded_by_retention:true`, and a `gap` event with
+  `reason:"retention_expiry"` is emitted whenever startup deleted rows, so the
+  app can explain the shorter replay instead of looking broken.
+* **NDJSON is the keep-longer escape hatch.** If a slice of history matters,
+  export it before it ages out — the export is a plain directory of NDJSON plus
+  `summary.json`, and it is the only form meant to outlive the window:
+
+```bash
+~/the-matrix/bin/matrix-collect --db ~/the-matrix/data/telemetry.sqlite --export /mnt/keep/matrix-$(date +%Y%m%d)
+```
+
+**Rotation (belt and braces):**
+
+```bash
+./deploy/db-rotate.sh --check                 # size, threshold, what it would do
+./deploy/db-rotate.sh --prefix ~/the-matrix   # archive with VACUUM INTO + fresh DB
+```
 
 ## Backup policy
 
